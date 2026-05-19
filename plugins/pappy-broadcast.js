@@ -14,6 +14,13 @@ const TEMP_DIR = path.join(__dirname, '../data/temp_media');
 const activeSchedules = new Map();
 const GROUP_CACHE_TTL_MS = 5 * 60 * 1000;
 const groupCache = new Map();
+const GODCAST_JOB_ATTEMPTS = Math.max(1, Number(process.env.GODCAST_JOB_ATTEMPTS || 8));
+const GCAST_JOB_ATTEMPTS = Math.max(1, Number(process.env.GCAST_JOB_ATTEMPTS || 5));
+const BROADCAST_JOB_BACKOFF_MS = Math.max(1500, Number(process.env.BROADCAST_JOB_BACKOFF_MS || 12000));
+const GODCAST_QUEUE_DELAY_JITTER_MS = Math.max(0, Number(process.env.GODCAST_QUEUE_DELAY_JITTER_MS || 3000));
+const GODCAST_CHUNK_PAUSE_MS = Math.max(100, Number(process.env.GODCAST_CHUNK_PAUSE_MS || 600));
+const LARGE_GROUP_THRESHOLD = Math.max(50, Number(process.env.GODCAST_LARGE_GROUP_THRESHOLD || 200));
+const GODCAST_LARGE_GROUP_JOB_ATTEMPTS = Math.max(GODCAST_JOB_ATTEMPTS, Number(process.env.GODCAST_LARGE_GROUP_JOB_ATTEMPTS || 12));
 
 function extractRelaySourceMessage(quotedMsg) {
     if (!quotedMsg || typeof quotedMsg !== 'object') return null;
@@ -187,33 +194,16 @@ async function executeBroadcastTask(sock, groupData, textContent, mode, chat, is
         finalPayloadText = randomTemplate(finalPayloadText || '');
     }
 
-    // Pre-fetch link preview ONCE before queuing — avoids 100x fetches for 100 groups
-    let preFetchedPreview = null;
-    if (!mediaPath && finalPayloadText) {
-        const { extractUrls, buildLinkPreview } = require('../core/linkPreview');
-        const urls = extractUrls(finalPayloadText);
-        if (urls.length > 0) {
-            try {
-                logger.info('[Broadcast] Pre-fetching link preview for: ' + urls[0]);
-                preFetchedPreview = await Promise.race([
-                    buildLinkPreview(finalPayloadText, isGodcast),
-                    new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 15000))
-                ]);
-                if (preFetchedPreview) logger.success('[Broadcast] Link preview pre-fetched: ' + (preFetchedPreview.title || 'ok'));
-            } catch (e) {
-                logger.warn('[Broadcast] Link preview pre-fetch failed: ' + e.message);
-            }
-        }
-    }
-
     let totalJobs = 0;
     let chunk = [];
     for (const group of groupData) {
+        const isLargeGroup = Number(group?.size || 0) >= LARGE_GROUP_THRESHOLD;
         chunk.push({
             name: `BCAST_${botId}_${group.id}`,
             data: {
                 botId,
                 targetJid: group.id,
+                groupSize: Number(group?.size || 0),
                 textContent: finalPayloadText,
                 mode,
                 commandType: isGodcast ? 'godcast' : 'gcast',
@@ -222,11 +212,23 @@ async function executeBroadcastTask(sock, groupData, textContent, mode, chat, is
                 useGhostProtocol: shouldUseGhost,
                 mediaPath,
                 isVideo,
-                sourceMessage: sourceMessage || (preFetchedPreview ? { _preFetchedPreview: preFetchedPreview } : null),
+                // Only pass real relay source payloads (quoted/current WA messages).
+                // Synthetic prefetch metadata must not masquerade as sourceMessage,
+                // otherwise downstream status/chat builders may skip native preview flow.
+                sourceMessage: sourceMessage || null,
                 sourceContextInfo,
                 campaignId
             },
-            opts: { priority: group.size > 100 ? 1 : 3, removeOnComplete: true, removeOnFail: 1000, delay: isGodcast ? Math.floor(Math.random() * 2000) : 0 }
+            opts: {
+                priority: group.size > 100 ? 1 : 3,
+                removeOnComplete: true,
+                removeOnFail: 1000,
+                // For godcast we keep retries inside the worker itself so one group fully
+                // completes (success/final-fail) before the next group job is processed.
+                attempts: isGodcast ? 1 : GCAST_JOB_ATTEMPTS,
+                backoff: { type: 'exponential', delay: BROADCAST_JOB_BACKOFF_MS },
+                delay: isGodcast ? Math.floor(Math.random() * (GODCAST_QUEUE_DELAY_JITTER_MS + 1)) : 0,
+            }
         });
         totalJobs++;
 
@@ -235,7 +237,7 @@ async function executeBroadcastTask(sock, groupData, textContent, mode, chat, is
                 await broadcastQueue.addBulk(chunk);
                 chunk = [];
                 await yieldLoop();
-                if (isGodcast) await new Promise(r => setTimeout(r, 200)); // extra breathing room for godcast
+                if (isGodcast) await new Promise(r => setTimeout(r, GODCAST_CHUNK_PAUSE_MS)); // extra breathing room for godcast
             } catch (error) { logger.error(`[Broadcast] Redis Bulk Add Failed: ${error.message}`); }
         }
     }
@@ -266,7 +268,19 @@ module.exports = {
     
     execute: async ({ sock, msg, args, text, user, botId }) => {
         const chat = msg.key.remoteJid;
-        const cmd = text.split(' ')[0].toLowerCase();
+        const rawText = String(text || '').replace(/^\.\ +/, '.').trim();
+        let cmd = rawText.split(/\s+/)[0].toLowerCase();
+        let normArgs = rawText.slice(cmd.length).trim().split(/\s+/).filter(Boolean);
+
+        // Support spaced mobile variants like ".god cast" and ".g cast"
+        if (cmd === '.god' && normArgs[0]?.toLowerCase() === 'cast') {
+            cmd = '.godcast';
+            normArgs = normArgs.slice(1);
+        }
+        if (cmd === '.g' && normArgs[0]?.toLowerCase() === 'cast') {
+            cmd = '.gcast';
+            normArgs = normArgs.slice(1);
+        }
         
         // Extract preview from CURRENT message (when user types command with link and preview loads)
         const currentMessageExtended = msg.message?.extendedTextMessage;
@@ -301,8 +315,8 @@ module.exports = {
 
         const schedCmds = ['.schedulecast', '.schedulegodcast', '.loopcast', '.loopgodcast'];
         if (schedCmds.includes(cmd)) {
-            const timeArg = args.shift();
-            const textContent = args.join(' ') || quotedText;
+            const timeArg = normArgs.shift();
+            const textContent = normArgs.join(' ') || quotedText;
             if (!timeArg || !textContent) return sock.sendMessage(chat, { text: '❌ Usage: .schedulecast 10m Message' });
             
             const time = parseTime(timeArg);
@@ -333,9 +347,9 @@ module.exports = {
 
         if (cmd === '.listschedule' || cmd === '.cancelschedule') {
             if (cmd === '.cancelschedule') {
-                if (activeSchedules.has(args[0])) { 
-                    clearTimeout(activeSchedules.get(args[0]).timeout);
-                    activeSchedules.delete(args[0]); 
+                if (activeSchedules.has(normArgs[0])) { 
+                    clearTimeout(activeSchedules.get(normArgs[0]).timeout);
+                    activeSchedules.delete(normArgs[0]); 
                     saveSchedules(); 
                     return sock.sendMessage(chat, {text: '🛑 Cancelled.'}); 
                 }
@@ -345,7 +359,7 @@ module.exports = {
         }
 
         if (cmd === '.gcast' || cmd === '.godcast') {
-            let textContent = args.join(' ').trim();
+            let textContent = normArgs.join(' ').trim();
 
             // If replying to a message, extract text from quoted message
             if (!textContent && quotedMsg) {
@@ -375,6 +389,11 @@ module.exports = {
             
             const isGodcast = cmd === '.godcast';
             const groupData = await fetchAllGroups(sock, botId);
+            if (!Array.isArray(groupData) || groupData.length === 0) {
+                return sock.sendMessage(chat, {
+                    text: '⚠️ No eligible groups found for broadcast right now.'
+                });
+            }
             const gsPlugin = (() => { try { return require('./pappy-groupstatus'); } catch { return null; } })();
             const gsConfig = gsPlugin?.getGsConfig(botId) || null;
             await executeBroadcastTask(

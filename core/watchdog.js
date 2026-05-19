@@ -13,6 +13,7 @@ class SmartWatchdog {
         this.timeoutMs = timeoutMs;
         // Each session gets its own isolated monitor — no shared state
         this.monitors = new Map();
+        this.silentCounts = new Map();
 
         this.healthInterval = setInterval(() => this._runDiagnostics(), HEALTH_INTERVAL_MS);
         this.healthInterval.unref(); // don't block process exit
@@ -60,7 +61,12 @@ class SmartWatchdog {
 
         try {
             if (idle > this.timeoutMs * PING_THRESHOLD_RATIO) {
-                try { m.sock.ws.ping(); } catch (e) { logger.error(`[WATCHDOG] Ping failed: ${e.message}`); }
+                try {
+                    const pingFn = m?.sock?.ws?.ping;
+                    if (typeof pingFn === 'function') pingFn.call(m.sock.ws);
+                } catch (e) {
+                    logger.error(`[WATCHDOG] Ping failed: ${e.message}`);
+                }
             }
 
             if (idle > this.timeoutMs) {
@@ -93,14 +99,24 @@ class SmartWatchdog {
         // but only if they were previously active (have a monitor)
         const now = Date.now();
         const SILENCE_THRESHOLD = 5 * 60 * 1000; // 5 min (was 10)
+        const SILENCE_ESCALATE_COUNT = 3;
         if (global._lastMsgActivity && global.waSocks) {
             for (const [sessionKey, sock] of global.waSocks.entries()) {
                 if (!sock?.user) continue; // not connected yet
                 const lastActivity = global._lastMsgActivity.get(sessionKey) || 0;
                 const silent = now - lastActivity;
                 if (lastActivity > 0 && silent > SILENCE_THRESHOLD) {
-                    logger.warn(`[WATCHDOG] Session ${sessionKey} silent for ${Math.round(silent/60000)}min — pinging`);
+                    const count = (this.silentCounts.get(sessionKey) || 0) + 1;
+                    this.silentCounts.set(sessionKey, count);
+                    logger.warn(`[WATCHDOG] Session ${sessionKey} silent for ${Math.round(silent/60000)}min — pinging (strike ${count})`);
                     try { sock.ws?.ping?.(); } catch {}
+                    if (count >= SILENCE_ESCALATE_COUNT) {
+                        logger.error(`[WATCHDOG] Session ${sessionKey} still silent after ${count} checks — forcing reconnect`);
+                        this.silentCounts.set(sessionKey, 0);
+                        try { sock.ws?.close?.(); } catch {}
+                    }
+                } else {
+                    this.silentCounts.set(sessionKey, 0);
                 }
             }
         }

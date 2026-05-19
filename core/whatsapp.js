@@ -19,10 +19,139 @@ const ownerManager = require('../modules/ownerManager');
 const logger = require('./logger');
 const engine = require('./engine'); 
 const { rememberPreviewHint } = require('./linkPreview');
+const { getYoutubeCookieArg } = require('./youtube');
 const { generateAnimatedSticker, generateTelegramSticker } = require('./stickerEngine');
+const { getKernel } = require('./runtimeKernel');
+const watchdog = require('./watchdog');
 
 const SESSIONS_PATH = path.join(__dirname, '../data/sessions');
 const STATE_FILE = path.join(__dirname, '../data/botState.json');
+const BANNED_ACCOUNTS_FILE = path.join(__dirname, '../data/wa-banned-accounts.json');
+
+// Track 403 bans persistently across restarts with exponential backoff
+let bannedAccounts = {};
+
+function loadBannedAccounts() {
+    fs.promises.readFile(BANNED_ACCOUNTS_FILE, 'utf8')
+        .then((raw) => {
+            try {
+                bannedAccounts = JSON.parse(raw || '{}');
+            } catch (e) {
+                logger.warn('Failed to load banned accounts list', { error: e.message });
+                bannedAccounts = {};
+            }
+        })
+        .catch(() => { bannedAccounts = {}; });
+}
+
+function saveBannedAccounts() {
+    fs.promises.mkdir(path.dirname(BANNED_ACCOUNTS_FILE), { recursive: true })
+        .then(() => fs.promises.writeFile(BANNED_ACCOUNTS_FILE, JSON.stringify(bannedAccounts, null, 2), 'utf8'))
+        .catch((e) => logger.warn('Failed to save banned accounts list', { error: e.message }));
+}
+
+function recordForbidden(phoneNumber) {
+    const phone = String(phoneNumber || '').replace(/[^0-9]/g, '');
+    if (!phone) return;
+    const entry = bannedAccounts[phone] || { firstSeenAt: Date.now(), failureCount: 0, lastFailureAt: Date.now() };
+    entry.failureCount = (entry.failureCount || 0) + 1;
+    entry.lastFailureAt = Date.now();
+    bannedAccounts[phone] = entry;
+    saveBannedAccounts();
+    logger.warn(`[Ban Tracker] Phone +${phone} recorded 403 failure #${entry.failureCount}`);
+}
+
+function isBannedOrBackingOff(phoneNumber) {
+    const phone = String(phoneNumber || '').replace(/[^0-9]/g, '');
+    if (!phone || !bannedAccounts[phone]) return false;
+    
+    const entry = bannedAccounts[phone];
+    const failCount = entry.failureCount || 1;
+    // Exponential backoff: 1min, 5min, 15min, 30min, 1hr, 4hr, 24hr
+    const backoffMins = [1, 5, 15, 30, 60, 240, 1440];
+    const backoffMs = backoffMins[Math.min(failCount - 1, backoffMins.length - 1)] * 60 * 1000;
+    const timeSinceLastFailure = Date.now() - (entry.lastFailureAt || 0);
+    
+    return timeSinceLastFailure < backoffMs;
+}
+
+function getBackoffStatus(phoneNumber) {
+    const phone = String(phoneNumber || '').replace(/[^0-9]/g, '');
+    if (!phone || !bannedAccounts[phone]) return null;
+    
+    const entry = bannedAccounts[phone];
+    const failCount = entry.failureCount || 1;
+    const backoffMins = [1, 5, 15, 30, 60, 240, 1440];
+    const backoffMs = backoffMins[Math.min(failCount - 1, backoffMins.length - 1)] * 60 * 1000;
+    const timeSinceLastFailure = Date.now() - (entry.lastFailureAt || 0);
+    const msRemaining = Math.max(0, backoffMs - timeSinceLastFailure);
+    const minsRemaining = Math.ceil(msRemaining / 60000);
+    
+    return {
+        failureCount: failCount,
+        backoffMinutes: backoffMins[Math.min(failCount - 1, backoffMins.length - 1)],
+        minutesRemaining: minsRemaining,
+        canRetry: msRemaining <= 0
+    };
+}
+
+function clearBanRecord(phoneNumber) {
+    const phone = String(phoneNumber || '').replace(/[^0-9]/g, '');
+    if (phone && bannedAccounts[phone]) {
+        delete bannedAccounts[phone];
+        saveBannedAccounts();
+        logger.info(`[Ban Tracker] Cleared ban record for +${phone}`);
+    }
+}
+
+// Purge node-specific artifacts for a phone number (keeps shared link Intel untouched)
+function purgeNodeArtifacts(phoneNumber, reason = 'unknown') {
+    const phone = String(phoneNumber || '').replace(/[^0-9]/g, '');
+    if (!phone) return;
+
+    (async () => {
+        try {
+            const dataDir = path.join(__dirname, '../data');
+
+            // Remove per-node state files
+            const exactFiles = [
+                getNodeStateFile(phone),
+                getNodeStickerCmdsFile(phone),
+                path.join(dataDir, `warmup-config-${phone}.json`),
+            ];
+            await Promise.all(exactFiles.map((fp) => fs.promises.unlink(fp).catch(() => {})));
+
+            // Remove warmup media files for this phone with any extension
+            try {
+                const names = await fs.promises.readdir(dataDir).catch(() => []);
+                const warmupFiles = names.filter((name) => name.startsWith(`warmup-media-${phone}.`));
+                await Promise.all(warmupFiles.map((name) => fs.promises.unlink(path.join(dataDir, name)).catch(() => {})));
+            } catch {}
+
+            // Remove all session folders for this phone across all slots/chats
+            try {
+                const sessionDirs = await fs.promises.readdir(SESSIONS_PATH).catch(() => []);
+                const matches = sessionDirs.filter((name) => name.includes(`_${phone}_`));
+                await Promise.all(matches.map((sessionName) => fs.promises.rm(path.join(SESSIONS_PATH, sessionName), { recursive: true, force: true }).catch(() => {})));
+            } catch {}
+
+            // Remove in-memory node state and caches for this phone
+            try { nodeStates.delete(phone); } catch {}
+            try { clearBanRecord(phone); } catch {}
+            try {
+                if (global._aiQueues) {
+                    for (const key of Array.from(global._aiQueues.keys())) {
+                        if (String(key).includes(`_${phone}_`)) global._aiQueues.delete(key);
+                    }
+                }
+            } catch {}
+
+            logger.system(`[Purge] Node +${phone} artifacts removed (${reason}) — link Intel preserved.`);
+        } catch (err) {
+            logger.warn(`[Purge] Failed to purge node +${phone}`, { error: err.message, reason });
+        }
+    })();
+}
 
 // Per-node state file — scoped by phone number so each node has isolated state
 function getNodeStateFile(phone) {
@@ -38,14 +167,22 @@ function getNodeStickerCmdsFile(phone) {
 }
 
 const activeSockets = new Map();
+const kernel = getKernel({ logger, engine });
 if (!global.waSockByBotId) global.waSockByBotId = new Map();
 // ─── GROUP METADATA CACHE (prevents WA 429 rate-limit errors) ───────────────
 const groupCache = require('./groupCache');
+const FORBIDDEN_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+const forbiddenAlertCache = new Map(); // sessionKey -> timestamp
+const forbiddenAlertPhoneCache = new Map(); // phone -> timestamp
 const MAX_PEER_SESSION_FILES = 500;
 
 // Track decrypt failures per session — auto-prune signal files when they spike
 const _decryptFailCount = new Map();
 const _decryptPruneThrottle = new Map();
+const HEARTBEAT_IDLE_MS = Number(process.env.WA_HEARTBEAT_IDLE_MS || 600000);
+const HEARTBEAT_INTERVAL_MS = Number(process.env.WA_HEARTBEAT_INTERVAL_MS || 30000);
+const AI_MAX_QUEUE_SIZE = Number(process.env.WA_AI_MAX_QUEUE_SIZE || 6);
+const AI_USER_COOLDOWN_MS = Number(process.env.WA_AI_USER_COOLDOWN_MS || 5000);
 
 function trackDecryptFailure(sessionKey, sessionDir) {
     const count = (_decryptFailCount.get(sessionKey) || 0) + 1;
@@ -59,42 +196,44 @@ function trackDecryptFailure(sessionKey, sessionDir) {
         _decryptPruneThrottle.set(sessionKey, Date.now());
 
         setImmediate(() => {
-            try {
-                if (!fs.existsSync(sessionDir)) return;
-                const files = fs.readdirSync(sessionDir)
-                    .filter(f => f.startsWith('session-') || f.startsWith('sender-key-'))
-                    .map(f => ({ f, mt: fs.statSync(path.join(sessionDir, f)).mtimeMs }))
-                    .sort((a, b) => b.mt - a.mt);
-                if (files.length <= 1500) return;
-                files.slice(1500).forEach(({ f }) => { try { fs.unlinkSync(path.join(sessionDir, f)); } catch {} });
-                logger.info(`[WA] Auto-pruned ${files.length - 1500} stale signal files for ${sessionKey} (decrypt spike)`);
-            } catch {}
+            (async () => {
+                try {
+                    const names = await fs.promises.readdir(sessionDir).catch(() => []);
+                    const files = await Promise.all(
+                        names
+                            .filter((f) => f.startsWith('session-') || f.startsWith('sender-key-'))
+                            .map(async (f) => ({ f, mt: (await fs.promises.stat(path.join(sessionDir, f)).catch(() => ({ mtimeMs: 0 }))).mtimeMs }))
+                    );
+                    files.sort((a, b) => b.mt - a.mt);
+                    if (files.length <= 1500) return;
+                    await Promise.all(files.slice(1500).map(({ f }) => fs.promises.unlink(path.join(sessionDir, f)).catch(() => {})));
+                    logger.info(`[WA] Auto-pruned ${files.length - 1500} stale signal files for ${sessionKey} (decrypt spike)`);
+                } catch {}
+            })();
         });
     }
 }
 
 function prunePeerSessions(sessionDir, maxFiles = MAX_PEER_SESSION_FILES) {
-    try {
-        if (!fs.existsSync(sessionDir)) return;
-        const sessionFiles = fs.readdirSync(sessionDir)
-            .filter((name) => name.startsWith('session-') && name.endsWith('.json'))
-            .map((name) => {
-                const fullPath = path.join(sessionDir, name);
-                const stat = fs.statSync(fullPath);
-                return { name, fullPath, mtimeMs: stat.mtimeMs };
-            })
-            .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    (async () => {
+        try {
+            const sessionFiles = (await fs.promises.readdir(sessionDir).catch(() => []))
+                .filter((name) => name.startsWith('session-') && name.endsWith('.json'))
+                .map((name) => {
+                    const fullPath = path.join(sessionDir, name);
+                    return fs.promises.stat(fullPath).then((stat) => ({ name, fullPath, mtimeMs: stat.mtimeMs })).catch(() => ({ name, fullPath, mtimeMs: 0 }));
+                });
+            const resolved = (await Promise.all(sessionFiles)).sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-        if (sessionFiles.length <= maxFiles) return;
-        const toDelete = sessionFiles.slice(maxFiles);
-        toDelete.forEach((entry) => {
-            try { fs.unlinkSync(entry.fullPath); } catch {}
-        });
+            if (resolved.length <= maxFiles) return;
+            const toDelete = resolved.slice(maxFiles);
+            await Promise.all(toDelete.map((entry) => fs.promises.unlink(entry.fullPath).catch(() => {})));
 
-        logger.warn(`[WA] Pruned peer sessions in ${path.basename(sessionDir)}: ${sessionFiles.length} -> ${maxFiles}`);
-    } catch (err) {
-        logger.warn(`[WA] Failed to prune peer sessions: ${err.message}`);
-    }
+            logger.warn(`[WA] Pruned peer sessions in ${path.basename(sessionDir)}: ${resolved.length} -> ${maxFiles}`);
+        } catch (err) {
+            logger.warn(`[WA] Failed to prune peer sessions: ${err.message}`);
+        }
+    })();
 }
 
 function getCachedAdminStatus(jid, sender) {
@@ -102,11 +241,157 @@ function getCachedAdminStatus(jid, sender) {
 }
 
 function refreshGroupMeta(sock, jid) {
-    groupCache.getGroupMeta(sock, jid).catch(() => {});
+    if (!global._groupMetaRefreshThrottle) global._groupMetaRefreshThrottle = new Map();
+    const botId = String(sock?.user?.id?.split(':')[0] || 'global');
+    const key = `${botId}:${String(jid || '')}`;
+    const now = Date.now();
+    const state = global._groupMetaRefreshThrottle.get(key) || { lastAt: 0, inflight: false };
+
+    // Avoid repeatedly fetching the same group metadata when the group is very active.
+    // A stale cache is fine here; it only affects admin-status freshness, not message delivery.
+    if (state.inflight || (now - state.lastAt) < 5 * 60 * 1000) return;
+
+    state.inflight = true;
+    state.lastAt = now;
+    global._groupMetaRefreshThrottle.set(key, state);
+
+    setImmediate(() => {
+        groupCache.getGroupMeta(sock, jid)
+            .catch(() => {})
+            .finally(() => {
+                state.inflight = false;
+                state.lastAt = Date.now();
+                global._groupMetaRefreshThrottle.set(key, state);
+            });
+    });
 }
 
 async function getCachedGroupMeta(sock, jid) {
     return groupCache.getGroupMeta(sock, jid);
+}
+
+async function resolveSongPollSelections(pollUpdate, cachedPoll) {
+    const selectedHashes = pollUpdate?.vote?.selectedOptions || [];
+    const pollOptions = cachedPoll?.message?.pollCreationMessageV3?.options || cachedPoll?.message?.pollCreationMessage?.options || [];
+    if (!pollOptions.length) return [];
+
+    try {
+        const { getAggregateVotesInPollMessage } = require('gifted-baileys');
+        const pollMessage = cachedPoll?.message;
+        const encKey = pollMessage?.pollCreationMessageV3?.encKey || pollMessage?.pollCreationMessage?.encKey;
+        if (pollMessage && encKey) {
+            const votes = await getAggregateVotesInPollMessage({
+                message: pollMessage,
+                pollUpdates: [pollUpdate],
+            }, encKey);
+            const names = (votes || [])
+                .filter((v) => Array.isArray(v?.voters) && v.voters.length > 0)
+                .map((v) => String(v?.name || '').trim())
+                .filter(Boolean);
+            if (names.length) return names;
+        }
+    } catch {}
+
+    if (!selectedHashes.length) return [];
+
+    const crypto = require('crypto');
+    const selectedNames = [];
+    for (const option of pollOptions) {
+        const optionName = String(option?.optionName || option?.name || '').trim();
+        if (!optionName) continue;
+        const optionHash = crypto.createHash('sha256').update(Buffer.from(optionName)).digest();
+        const matches = selectedHashes.some((hash) => {
+            const hashBuf = Buffer.isBuffer(hash) ? hash : Buffer.from(String(hash), 'base64');
+            return hashBuf.equals(optionHash);
+        });
+        if (matches) selectedNames.push(optionName);
+    }
+
+    return selectedNames;
+}
+
+async function handleSongPollSelection(sock, groupJid, pollCreationId, selectedNames) {
+    if (!groupJid || !pollCreationId || !selectedNames.length) return false;
+
+    if (!global._handledSongPollVotes) global._handledSongPollVotes = new Set();
+    const dedupKey = `${groupJid}:${pollCreationId}:${selectedNames.join('|')}`;
+    if (global._handledSongPollVotes.has(dedupKey)) return true;
+    global._handledSongPollVotes.add(dedupKey);
+    setTimeout(() => global._handledSongPollVotes?.delete(dedupKey), 5 * 60 * 1000);
+
+    const votedText = selectedNames.join(' ');
+    const songTitle = String(selectedNames[0] || votedText).replace(/\s*\[.*?\]\s*$/, '').trim();
+    if (!songTitle) return false;
+
+    let cachedResult = null;
+    if (global._songSearchCache?.size) {
+        for (const [token, entry] of global._songSearchCache.entries()) {
+            if (entry.jid !== groupJid) continue;
+            const idx = entry.results.findIndex((r) => {
+                const ref = String(r?.title || '').slice(0, 30);
+                return votedText.includes(ref) || ref.includes(votedText.slice(0, 30));
+            });
+            if (idx === -1) continue;
+            cachedResult = entry.results[idx];
+            global._songSearchCache.delete(token);
+            break;
+        }
+    }
+
+    const statusMsg = await sock.sendMessage(groupJid, {
+        text: `⏳ Got it! Downloading *${songTitle}*...\n🎵 Sending shortly`
+    });
+
+    try {
+        const { downloadAudio, searchYoutube } = require('./youtube');
+
+        let baseResult = cachedResult;
+        if (!baseResult?.videoId) {
+            const fresh = await searchYoutube(songTitle, 1);
+            baseResult = fresh?.[0] || null;
+        }
+        if (!baseResult?.videoId) throw new Error('No result found for selected song');
+
+        const candidates = [baseResult];
+        try {
+            const more = await searchYoutube(songTitle || baseResult.title || '', 5);
+            for (const c of (more || [])) {
+                if (!c?.videoId) continue;
+                if (!candidates.some((x) => x?.videoId === c.videoId)) candidates.push(c);
+            }
+        } catch {}
+
+        let dl = null;
+        let picked = baseResult;
+        let lastErr;
+        for (const c of candidates) {
+            if (!c?.videoId) continue;
+            try {
+                dl = await downloadAudio(c.videoId);
+                picked = c;
+                break;
+            } catch (err) {
+                lastErr = err;
+            }
+        }
+        if (!dl) throw (lastErr || new Error('No downloadable candidate'));
+
+        const ext = dl.fileExt || 'm4a';
+        const mimetype = dl.mimetype || 'audio/mp4';
+        const safeName = String(picked.title || songTitle || 'track').replace(/[\\/:*?"<>|]/g, '').slice(0, 80) || 'track';
+        await sock.sendMessage(groupJid, {
+            audio: dl.buffer,
+            mimetype,
+            ptt: false,
+            fileName: `${safeName}.${ext}`
+        });
+        await sock.sendMessage(groupJid, { delete: statusMsg.key }).catch(() => {});
+        return true;
+    } catch (e) {
+        await sock.sendMessage(groupJid, { text: `❌ Download failed: ${e.message.slice(0, 100)}` });
+        await sock.sendMessage(groupJid, { delete: statusMsg.key }).catch(() => {});
+        return false;
+    }
 }
 
 // 🧠 SaaS Fix: Expose this globally so bullEngine.js can find the sockets!
@@ -134,21 +419,23 @@ if (!global._senderIndexCleanupStarted) {
 
     // Scheduled signal file cleanup every 6 hours
     setInterval(() => {
-        try {
-            const sessionsPath = path.join(__dirname, '../data/sessions');
-            if (!fs.existsSync(sessionsPath)) return;
-            for (const d of fs.readdirSync(sessionsPath)) {
-                const dir = path.join(sessionsPath, d);
-                try { if (!fs.statSync(dir).isDirectory()) continue; } catch { continue; }
-                const files = fs.readdirSync(dir).filter(f => f.startsWith('session-') || f.startsWith('sender-key-'));
-                if (files.length <= 3000) continue;
-                const sorted = files
-                    .map(f => { try { return { f, mt: fs.statSync(path.join(dir, f)).mtimeMs }; } catch { return null; } })
-                    .filter(Boolean).sort((a, b) => b.mt - a.mt);
-                sorted.slice(3000).forEach(({ f }) => { try { fs.unlinkSync(path.join(dir, f)); } catch {} });
-                logger.warn(`[WA] Scheduled prune: removed ${sorted.length - 3000} signal files from ${d}`);
-            }
-        } catch {}
+        (async () => {
+            try {
+                const sessionsPath = path.join(__dirname, '../data/sessions');
+                const dirs = await fs.promises.readdir(sessionsPath).catch(() => []);
+                for (const d of dirs) {
+                    const dir = path.join(sessionsPath, d);
+                    try { if (!(await fs.promises.stat(dir)).isDirectory()) continue; } catch { continue; }
+                    const files = await fs.promises.readdir(dir).catch(() => []);
+                    const signalFiles = files.filter((f) => f.startsWith('session-') || f.startsWith('sender-key-'));
+                    if (signalFiles.length <= 3000) continue;
+                    const sorted = (await Promise.all(signalFiles.map(async (f) => ({ f, mt: (await fs.promises.stat(path.join(dir, f)).catch(() => ({ mtimeMs: 0 }))).mtimeMs }))))
+                        .sort((a, b) => b.mt - a.mt);
+                    await Promise.all(sorted.slice(3000).map(({ f }) => fs.promises.unlink(path.join(dir, f)).catch(() => {})));
+                    logger.warn(`[WA] Scheduled prune: removed ${sorted.length - 3000} signal files from ${d}`);
+                }
+            } catch {}
+        })();
     }, 6 * 60 * 60 * 1000).unref();
 }
 if (!global._aiReplyCache) global._aiReplyCache = new Map();
@@ -182,17 +469,112 @@ function canAiReply(msgId) {
     return true;
 }
 
+function stopSocketHeartbeat(sessionKey) {
+    if (!global._waHeartbeatTimers) global._waHeartbeatTimers = new Map();
+    const timer = global._waHeartbeatTimers.get(sessionKey);
+    if (timer) {
+        clearInterval(timer);
+        global._waHeartbeatTimers.delete(sessionKey);
+    }
+}
+
+function bindSocketLiveness(sessionKey, sock) {
+    if (!global._waWsLivenessHandlers) global._waWsLivenessHandlers = new Map();
+    const ws = sock?.ws;
+    if (!ws || typeof ws.on !== 'function') return;
+
+    const touch = () => {
+        if (!global._lastEventActivity) global._lastEventActivity = new Map();
+        global._lastEventActivity.set(sessionKey, Date.now());
+    };
+    const onMessage = () => touch();
+    const onPong = () => {
+        sock._lastPongAt = Date.now();
+        touch();
+    };
+
+    try {
+        ws.on('message', onMessage);
+        ws.on('pong', onPong);
+        global._waWsLivenessHandlers.set(sessionKey, { ws, onMessage, onPong });
+        sock._lastPongAt = Date.now();
+        touch();
+    } catch {}
+}
+
+function unbindSocketLiveness(sessionKey) {
+    if (!global._waWsLivenessHandlers) return;
+    const entry = global._waWsLivenessHandlers.get(sessionKey);
+    if (!entry) return;
+
+    try {
+        entry.ws?.removeListener?.('message', entry.onMessage);
+        entry.ws?.removeListener?.('pong', entry.onPong);
+    } catch {}
+
+    global._waWsLivenessHandlers.delete(sessionKey);
+}
+
+function startSocketHeartbeat(sessionKey, sock, reconnectFn) {
+    if (!global._waHeartbeatTimers) global._waHeartbeatTimers = new Map();
+    stopSocketHeartbeat(sessionKey);
+
+    const timer = setInterval(() => {
+        try {
+            const liveSock = activeSockets.get(sessionKey);
+            if (!liveSock || liveSock !== sock) return;
+
+            const lastMsg = Number(global._lastMsgActivity?.get(sessionKey) || 0);
+            const lastEvt = Number(global._lastEventActivity?.get(sessionKey) || 0);
+            const last = Math.max(lastMsg, lastEvt, Number(sock._openedAt || 0));
+            const idleMs = Date.now() - (last || Date.now());
+            const sincePong = Date.now() - Number(sock._lastPongAt || 0);
+
+            try { liveSock.ws?.ping?.(); } catch {}
+
+            // Treat as zombie only if both event activity and pong responses are stale.
+            if (
+                idleMs > HEARTBEAT_IDLE_MS &&
+                sincePong > (HEARTBEAT_INTERVAL_MS * 3) &&
+                liveSock?.user &&
+                liveSock.ws?.readyState === 1
+            ) {
+                logger.warn(`[Heartbeat] Zombie socket suspected for ${sessionKey} (idle ${Math.round(idleMs / 1000)}s) — refreshing socket`);
+                try { liveSock.ev?.removeAllListeners?.(); } catch {}
+                try { liveSock.ws?.close?.(); } catch {}
+                stopSocketHeartbeat(sessionKey);
+                reconnectFn();
+            }
+        } catch (err) {
+            logger.warn(`[Heartbeat] ${sessionKey} check failed: ${err.message}`);
+        }
+    }, HEARTBEAT_INTERVAL_MS);
+
+    timer.unref?.();
+    global._waHeartbeatTimers.set(sessionKey, timer);
+}
+
+function teardownSocket(sessionKey, sock, reason = 'unknown') {
+    if (global._groupInvalidateQueues?.has(sessionKey)) {
+        const state = global._groupInvalidateQueues.get(sessionKey);
+        if (state?.timer) clearTimeout(state.timer);
+        global._groupInvalidateQueues.delete(sessionKey);
+    }
+    try { sock?.ev?.removeAllListeners?.(); } catch {}
+    try { sock?.ws?.close?.(); } catch {}
+    unbindSocketLiveness(sessionKey);
+    stopSocketHeartbeat(sessionKey);
+    kernel.presenceManager.stop(sessionKey);
+    unbindSocketAliases(sock);
+    activeSockets.delete(sessionKey);
+    kernel.socketManager.remove(sessionKey);
+    logger.info(`[WA] Socket teardown complete for ${sessionKey} (${reason})`);
+}
+
 function getNodeState(phone) {
     const digits = String(phone || '').replace(/[^0-9]/g, '');
     if (!digits) return botState;
-    if (!nodeStates.has(digits)) {
-        const stateFile = getNodeStateFile(digits);
-        let state = { isSleeping: false, pappyMode: {}, commandPrefix: globalPrefix, nodeMode: 'public' };
-        if (fs.existsSync(stateFile)) {
-            try { state = { ...state, ...JSON.parse(fs.readFileSync(stateFile, 'utf-8')) }; } catch {}
-        }
-        nodeStates.set(digits, state);
-    }
+    if (!nodeStates.has(digits)) nodeStates.set(digits, { isSleeping: false, pappyMode: {}, commandPrefix: globalPrefix, nodeMode: 'public' });
     return nodeStates.get(digits);
 }
 
@@ -201,7 +583,7 @@ function saveNodeState(phone) {
     if (!digits) return;
     const state = nodeStates.get(digits);
     if (!state) return;
-    try { fs.writeFileSync(getNodeStateFile(digits), JSON.stringify(state)); } catch {}
+    fs.promises.writeFile(getNodeStateFile(digits), JSON.stringify(state)).catch(() => {});
 }
 
 function bindSocketAliases(sock, aliases = []) {
@@ -220,21 +602,59 @@ function unbindSocketAliases(sock) {
 }
 
 const STICKER_CACHE_DIR = path.join(__dirname, '../data/sticker_cache');
-if (!fs.existsSync(STICKER_CACHE_DIR)) fs.mkdirSync(STICKER_CACHE_DIR, { recursive: true });
+const STICKER_CMDS_FILE = path.join(__dirname, '../data/stickerCmds.json');
+let YT_DLP_BIN = 'yt-dlp';
+fs.promises.access('/usr/local/bin/yt-dlp').then(() => { YT_DLP_BIN = '/usr/local/bin/yt-dlp'; }).catch(() => {});
 
-if (!fs.existsSync(SESSIONS_PATH)) fs.mkdirSync(SESSIONS_PATH, { recursive: true });
-if (!fs.existsSync(path.join(__dirname, '../data'))) fs.mkdirSync(path.join(__dirname, '../data'));
+async function refreshStickerCmdCache() {
+    try {
+        const raw = await fs.promises.readFile(STICKER_CMDS_FILE, 'utf-8');
+        const parsed = JSON.parse(raw);
+        global._stickerCmdsCache = (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch {
+        global._stickerCmdsCache = global._stickerCmdsCache || {};
+    }
+}
+
+fs.promises.mkdir(STICKER_CACHE_DIR, { recursive: true }).catch(() => {});
+fs.promises.mkdir(SESSIONS_PATH, { recursive: true }).catch(() => {});
+fs.promises.mkdir(path.join(__dirname, '../data'), { recursive: true }).catch(() => {});
+refreshStickerCmdCache().catch(() => {});
+setInterval(() => refreshStickerCmdCache().catch(() => {}), 30000).unref();
 
 const loadState = () => {
-    if (fs.existsSync(STATE_FILE)) {
-        try {
-            const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
-            botState = { pappyMode: {}, autoPairEnabled: false, commandPrefix: globalPrefix, ...parsed };
-        } catch { botState = { isSleeping: false, autoPairEnabled: false, pappyMode: {}, commandPrefix: globalPrefix }; }
-    }
+    fs.promises.readFile(STATE_FILE, 'utf-8')
+        .then((raw) => {
+            try {
+                const parsed = JSON.parse(raw);
+                botState = { pappyMode: {}, autoPairEnabled: false, commandPrefix: globalPrefix, ...parsed };
+            } catch {
+                botState = { isSleeping: false, autoPairEnabled: false, pappyMode: {}, commandPrefix: globalPrefix };
+            }
+        })
+        .catch(() => {});
 };
-const saveState = () => fs.writeFileSync(STATE_FILE, JSON.stringify(botState));
+const saveState = () => fs.promises.writeFile(STATE_FILE, JSON.stringify(botState)).catch(() => {});
 loadState();
+loadBannedAccounts();
+
+async function preloadNodeStates() {
+    try {
+        const dataDir = path.join(__dirname, '../data');
+        const entries = await fs.promises.readdir(dataDir);
+        const files = entries.filter((name) => /^botState-\d+\.json$/i.test(name));
+        await Promise.all(files.map(async (name) => {
+            const phone = name.match(/^botState-(\d+)\.json$/i)?.[1];
+            if (!phone || nodeStates.has(phone)) return;
+            try {
+                const raw = await fs.promises.readFile(path.join(dataDir, name), 'utf8');
+                const parsed = JSON.parse(raw);
+                nodeStates.set(phone, { isSleeping: false, pappyMode: {}, commandPrefix: globalPrefix, nodeMode: 'public', ...parsed });
+            } catch {}
+        }));
+    } catch {}
+}
+preloadNodeStates().catch(() => {});
 
 const ownerWaSet = new Set((ownerWhatsAppJids || []).map((j) => String(j || '').trim()).filter(Boolean));
 const ownerWaDigits = new Set(Array.from(ownerWaSet).map((j) => String(j || '').replace(/[^0-9]/g, '')).filter(Boolean));
@@ -331,8 +751,35 @@ function resolveSenderJid(msg, fallbackBotJid) {
 async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1', isRestart = false, retryCount = 0) {
     if (botState.isSleeping && !isRestart) return;
 
+    // Check if account is in backoff period due to 403 bans (restart flows only)
+    if (isRestart && isBannedOrBackingOff(phoneNumber)) {
+        const backoffStatus = getBackoffStatus(phoneNumber);
+        logger.info(`[Ban Backoff] Skipping +${phoneNumber} (failure #${backoffStatus.failureCount}, retry in ${backoffStatus.minutesRemaining}min)`);
+        if (global.tgBot && retryCount === 0) { // Only notify once per startup
+            global.tgBot.telegram.sendMessage(chatId,
+                `⏳ <b>ACCOUNT IN RECOVERY</b>\nNode +${phoneNumber} is recovering from 403 ban.\n\n<b>Auto-retry in ${backoffStatus.minutesRemaining} minutes.</b>\n\nOr use /pair to re-link immediately.`,
+                { parse_mode: 'HTML' }
+            ).catch(() => {});
+        }
+        return;
+    }
+
     const sessionKey = `${chatId}_${phoneNumber}_${slotId}`;
+
+    if (!global._kernelStarted) {
+        global._kernelStarted = true;
+        try { kernel.start(); } catch {}
+    }
+
+    if (!global._lastEventActivity) global._lastEventActivity = new Map();
+
+    kernel.reconnectManager.setState(sessionKey, 'CONNECTING');
     if (activeSockets.has(sessionKey) && !isRestart) return;
+
+    if (isRestart && activeSockets.has(sessionKey)) {
+        const oldSock = activeSockets.get(sessionKey);
+        if (oldSock) teardownSocket(sessionKey, oldSock, 'pre-reconnect-refresh');
+    }
 
     const sessionDir = path.join(SESSIONS_PATH, sessionKey);
     // Do NOT prune before socket creation — deleting session files before connect
@@ -382,9 +829,13 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
         }
     });
 
+    kernel.socketManager.register(sessionKey, sock);
+
     // ─── PAIRING CODE GENERATION ───
-    // Only request pairing on fresh sessions (not restarts) and only once
     if (!sock?.authState?.creds?.registered && !isRestart) {
+            // Clear ban record when user re-pairs — allow immediate reconnection
+            clearBanRecord(phoneNumber);
+
         logger.system(`Initiating pairing sequence for +${phoneNumber}...`);
 
         let userLabel = 'papp-bot';
@@ -395,30 +846,31 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
             } catch {}
         }
 
-        // Wait for socket to be open before requesting pairing code
         const requestPairing = async () => {
+            const cleanNumber = String(phoneNumber).replace(/[^0-9]/g, '');
             try {
-                const cleanNumber = String(phoneNumber).replace(/[^0-9]/g, '');
-                // Wait for WA connection to be fully open (not just started)
-                await new Promise((resolve) => {
-                    if (sock.ws?.readyState === 1) return resolve();
-                    const check = setInterval(() => {
-                        if (sock.ws?.readyState === 1) { clearInterval(check); resolve(); }
-                    }, 500);
-                    setTimeout(() => { clearInterval(check); resolve(); }, 15000);
-                });
-                await delay(2000); // extra settle time
+                sock._pairingInProgress = true;
+                sock._pairingRequestedAt = Date.now();
+                await delay(1500);
                 let code;
-                // Retry up to 3 times on 428
                 for (let attempt = 1; attempt <= 3; attempt++) {
                     try {
                         code = await sock.requestPairingCode(cleanNumber);
                         break;
                     } catch (e) {
-                        if (attempt < 3 && (e?.output?.statusCode === 428 || String(e.message).includes('428') || String(e.message).includes('Connection Closed'))) {
-                            logger.warn(`[Pair] Attempt ${attempt} failed (${e.message}), retrying in 3s...`);
-                            await delay(3000);
-                        } else throw e;
+                        const shouldRetry = attempt < 3 && (
+                            e?.output?.statusCode === 428 ||
+                            String(e.message).includes('428') ||
+                            String(e.message).includes('Connection Closed') ||
+                            String(e.message).includes('Precondition') ||
+                            String(e.message).includes('not-authorized')
+                        );
+                        if (shouldRetry) {
+                            logger.warn(`[Pair] Attempt ${attempt} failed (${e.message}), retrying in 2s...`);
+                            await delay(2000);
+                        } else {
+                            throw e;
+                        }
                     }
                 }
                 logger.system(`PAIRING CODE FOR +${cleanNumber}: ${code}`);
@@ -429,12 +881,20 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                         { parse_mode: 'HTML' }
                     ).catch(e => logger.error(`Failed to send pairing code: ${e.message}`));
                 }
-                // Mark code as sent so connection close doesn't trigger failure message
                 sock._pairingCodeSent = true;
+                sock._pairingCodeSentAt = Date.now();
             } catch (err) {
-                // Don't show error if code was already sent — connection close after code is normal
                 if (sock._pairingCodeSent) {
-                    logger.info(`[Pair] Socket closed after code sent for +${cleanNumber} — normal, waiting for user to enter code`);
+                    logger.info(`[Pair] Socket closed after code sent for +${cleanNumber} — normal`);
+                    return;
+                }
+                const msg = String(err?.message || err);
+                const transient = /connection closed|precondition|not-authorized|408|428/i.test(msg);
+                const rounds = Number(sock._pairingRetryRounds || 0);
+                if (transient && rounds < 2) {
+                    sock._pairingRetryRounds = rounds + 1;
+                    logger.warn(`[Pair] Transient pairing error (${msg}) — retry round ${sock._pairingRetryRounds}/2 in 4s...`);
+                    setTimeout(requestPairing, 4000);
                     return;
                 }
                 logger.error(`Pairing code error: ${err.message}`);
@@ -447,12 +907,21 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 }
             }
         };
-        // Small delay to let socket stabilize before requesting
-        setTimeout(requestPairing, 1500);
+        setTimeout(requestPairing, 500);
     }
 
     activeSockets.set(sessionKey, sock);
     bindSocketAliases(sock, [String(phoneNumber).replace(/[^0-9]/g, '')]);
+    bindSocketLiveness(sessionKey, sock);
+    try {
+        watchdog.attach(sessionKey, sock, () => {
+            kernel.reconnectManager.schedule(
+                sessionKey,
+                () => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1),
+                'watchdog-zombie'
+            );
+        });
+    } catch {}
     // Fix: Only setMaxListeners if available (Baileys update compatibility)
     if (typeof sock.ev.setMaxListeners === 'function') {
         sock.ev.setMaxListeners(20);
@@ -462,8 +931,10 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
     // ─── CONNECTION HANDLING ───
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
+        global._lastEventActivity.set(sessionKey, Date.now());
 
         if (connection === 'close') {
+            kernel.socketManager.setState(sessionKey, 'DISCONNECTED');
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const errMsg = String(lastDisconnect?.error?.message || '').toLowerCase();
             const isLoggedOut = statusCode === DisconnectReason.loggedOut;
@@ -473,14 +944,15 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
             const isRateLimited = statusCode === 429;
 
             activeSockets.delete(sessionKey);
+            unbindSocketLiveness(sessionKey);
+            stopSocketHeartbeat(sessionKey);
+            kernel.presenceManager.stop(sessionKey);
             unbindSocketAliases(sock);
+            try { watchdog.detach(sessionKey); } catch {}
 
             if (isLoggedOut) {
                 logger.system(`🚨 LOGGED OUT — purging session ${sessionKey}`);
-                const dir = path.join(SESSIONS_PATH, sessionKey);
-                if (fs.existsSync(dir)) {
-                    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-                }
+                purgeNodeArtifacts(phoneNumber, 'logged-out');
                 if (global.tgBot) {
                     global.tgBot.telegram.sendMessage(
                         chatId,
@@ -493,10 +965,17 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
 
             // 403 = WhatsApp banned/blocked the session — stop retrying, notify owner
             if (isForbidden) {
-                logger.system(`🚫 FORBIDDEN (403) — stopping reconnect for ${sessionKey}. Account may be banned.`);
-                if (global.tgBot) {
+                logger.system(`🚫 FORBIDDEN (403) — purging node artifacts for ${sessionKey}. Re-pair required.`);
+                purgeNodeArtifacts(phoneNumber, 'forbidden-403');
+                const phoneKey = String(phoneNumber || '').replace(/[^0-9]/g, '');
+                const alertKey = phoneKey || sessionKey;
+                const lastAlertAt = Number(forbiddenAlertPhoneCache.get(alertKey) || forbiddenAlertCache.get(sessionKey) || 0);
+                const shouldAlert = Date.now() - lastAlertAt > FORBIDDEN_ALERT_COOLDOWN_MS;
+                if (global.tgBot && shouldAlert) {
+                    forbiddenAlertPhoneCache.set(alertKey, Date.now());
+                    forbiddenAlertCache.set(sessionKey, Date.now());
                     global.tgBot.telegram.sendMessage(chatId,
-                        `🚫 <b>CONNECTION FORBIDDEN (403)</b>\nNode +${phoneNumber} was rejected by WhatsApp.\nThe account may be temporarily or permanently banned.\nUse /pair to re-link if you believe this is a mistake.`,
+                        `🚫 <b>CONNECTION FORBIDDEN (403)</b>\nNode +${phoneNumber} was rejected by WhatsApp.\nThe account may be temporarily or permanently banned.\n\n🗑️ Node session/state files were purged.\n\nUse /pair to re-link this number.`,
                         { parse_mode: 'HTML' }
                     ).catch(() => {});
                 }
@@ -507,7 +986,11 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
             if (isRateLimited) {
                 const rateLimitDelay = 5 * 60 * 1000; // 5 minutes
                 logger.system(`⏳ RATE LIMITED (429) — waiting 5 min before reconnecting ${sessionKey}...`);
-                setTimeout(() => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1), rateLimitDelay);
+                kernel.reconnectManager.schedule(
+                    sessionKey,
+                    () => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1),
+                    'rate-limit-429'
+                );
                 return;
             }
 
@@ -538,7 +1021,11 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 if (badMacCount <= 2) {
                     const backoff = 10000 + Math.floor(Math.random() * 5000);
                     logger.system(`[WA] Soft reconnect for ${sessionKey} in ${Math.round(backoff/1000)}s (bad MAC ${badMacCount}/5)`);
-                    setTimeout(() => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1), backoff);
+                    kernel.reconnectManager.schedule(
+                        sessionKey,
+                        () => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1),
+                        'bad-mac-soft'
+                    );
                     return;
                 }
 
@@ -559,7 +1046,11 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
 
                 const backoff = Math.min(20000 * Math.pow(2, badMacCount - 3), 60000) + Math.floor(Math.random() * 5000);
                 logger.system(`[WA] Reconnecting ${sessionKey} in ${Math.round(backoff/1000)}s after signal wipe (bad MAC ${badMacCount}/5)`);
-                setTimeout(() => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1), backoff);
+                kernel.reconnectManager.schedule(
+                    sessionKey,
+                    () => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1),
+                    'bad-mac-signal-wipe'
+                );
                 return;
             }
 
@@ -568,10 +1059,17 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
             const jitter = Math.floor(Math.random() * 1500);
             const reconnectDelay = Math.min(baseDelay * Math.pow(2, Math.min(retryCount, 4)), 60000) + jitter;
             logger.system(`Connection closed (code ${statusCode}). Reconnecting ${sessionKey} in ${Math.round(reconnectDelay / 1000)}s (attempt ${retryCount + 1})...`);
-            setTimeout(() => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1), reconnectDelay);
+            kernel.reconnectManager.schedule(
+                sessionKey,
+                () => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1),
+                `close-${statusCode || 'unknown'}`
+            );
         }
         
         if (connection === 'open') {
+            kernel.socketManager.setState(sessionKey, 'OPEN');
+            kernel.reconnectManager.markOpen(sessionKey);
+            sock._openedAt = Date.now();
             const connectedBotId = sock.user?.id?.split(':')[0];
             bindSocketAliases(sock, [connectedBotId, String(phoneNumber).replace(/[^0-9]/g, '')]);
             retryCount = 0;
@@ -614,25 +1112,24 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                     if (global._presenceIntervals.has(sessionKey)) {
                         clearInterval(global._presenceIntervals.get(sessionKey));
                     }
-                    const interval = setInterval(async () => {
-                        try {
-                            if (!activeSockets.has(sessionKey)) {
-                                clearInterval(interval);
-                                global._presenceIntervals.delete(sessionKey);
-                                return;
-                            }
-                            await sock.sendPresenceUpdate('available');
-                        } catch {}
-                    }, 4 * 60 * 1000);
-                    interval.unref();
-                    global._presenceIntervals.set(sessionKey, interval);
+                    kernel.presenceManager.start(sessionKey, sock);
                 } catch {}
             }, 3000);
 
+            startSocketHeartbeat(sessionKey, sock, () => {
+                kernel.reconnectManager.schedule(
+                    sessionKey,
+                    () => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1),
+                    'heartbeat-stale'
+                );
+            });
+
             // --- BEGIN: Send one-time CONNECTED message after pairing ---
             const stateFile = path.join(SESSIONS_PATH, sessionKey, 'connected.flag');
-            if (!fs.existsSync(stateFile)) {
-                fs.writeFileSync(stateFile, 'connected'); // write flag FIRST before any async ops
+            try {
+                await fs.promises.access(stateFile);
+            } catch {
+                fs.promises.writeFile(stateFile, 'connected').catch(() => {}); // write flag FIRST before any async ops
                 if (global.tgBot) {
                     // Main connected message with node inline button + user guide
                     global.tgBot.telegram.sendMessage(
@@ -669,6 +1166,53 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
         // Update last activity timestamp for self-healing
         if (!global._lastMsgActivity) global._lastMsgActivity = new Map();
         global._lastMsgActivity.set(sessionKey, Date.now());
+        global._lastEventActivity.set(sessionKey, Date.now());
+
+        // Dispatcher-first routing: keep the hot path lightweight.
+        try {
+            const botIdNow = sock.user?.id?.split(':')[0] || phoneNumber;
+            for (const m of (messages || [])) {
+                const jid = m?.key?.remoteJid;
+                if (!jid) continue;
+                const text =
+                    m.message?.conversation
+                    || m.message?.extendedTextMessage?.text
+                    || m.message?.imageMessage?.caption
+                    || m.message?.videoMessage?.caption
+                    || '';
+                const sender = extractSender(m);
+                const isGroup = jid.endsWith('@g.us');
+                const ctx = {
+                    sock,
+                    msg: m,
+                    jid,
+                    text,
+                    sender,
+                    isGroup,
+                    botId: botIdNow,
+                    isGroupAdmin: false,
+                    flags: {},
+                };
+                kernel.messageRouter.dispatch(ctx).catch(() => {});
+            }
+
+            // Command-first reliability: when a batch is command-only, skip legacy heavy pipeline.
+            const hasNonCommand = (messages || []).some((m) => {
+                const t = (
+                    m?.message?.conversation
+                    || m?.message?.extendedTextMessage?.text
+                    || m?.message?.imageMessage?.caption
+                    || m?.message?.videoMessage?.caption
+                    || ''
+                ).trim();
+                return !!t && !normalizeCommandText(t, phoneNumber);
+            });
+            if (!hasNonCommand) return;
+
+            if (String(process.env.WA_ROUTER_ONLY || '').toLowerCase() === 'true') {
+                return;
+            }
+        } catch {}
 
         // ── POLL VOTE DETECTION for .song ──────────────────────────────────────
         for (const m of messages) {
@@ -680,78 +1224,16 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 // Get the poll creation message to read option names
                 const pollCreationKey = m.message.pollUpdateMessage.pollCreationMessageKey?.id;
                 const cachedPoll = global.messageCache?.get(pollCreationKey);
+                if (!cachedPoll) continue;
                 const pollName = cachedPoll?.message?.pollCreationMessageV3?.name || cachedPoll?.message?.pollCreationMessage?.name || '';
                 if (!pollName.includes('Pick a song')) continue;
 
-                // Get voted option index from selectedOptions hash
-                const selectedHashes = m.message.pollUpdateMessage.vote?.selectedOptions || [];
-                if (!selectedHashes.length) continue;
+                const selectedNames = (await resolveSongPollSelections(m.message.pollUpdateMessage, cachedPoll))
+                    .map((name) => String(name || '').replace(/\s*\[.*?\]\s*$/, '').trim())
+                    .filter(Boolean);
+                if (!selectedNames.length) continue;
 
-                const opts = cachedPoll?.message?.pollCreationMessageV3?.options || cachedPoll?.message?.pollCreationMessage?.options || [];
-                let votedName = '';
-                let votedIdx = 0;
-                if (opts.length) {
-                    const crypto = require('crypto');
-                    for (let i = 0; i < opts.length; i++) {
-                        const optName = opts[i].optionName || '';
-                        const hash = crypto.createHash('sha256').update(Buffer.from(optName)).digest();
-                        if (selectedHashes.some(h => {
-                            const hBuf = Buffer.isBuffer(h) ? h : Buffer.from(h);
-                            return hBuf.equals(hash);
-                        })) {
-                            votedName = optName;
-                            votedIdx = i;
-                            break;
-                        }
-                    }
-                }
-
-                // Extract song title from option (format: "Title [duration]")
-                const songTitle = (votedName || opts[votedIdx]?.optionName || '').replace(/\s*\[.*?\]\s*$/, '').trim();
-                if (!songTitle) continue;
-
-                // Find the cached result by matching title so we use the exact URL
-                let cachedResult = null;
-                if (global._songSearchCache?.size) {
-                    for (const [token, entry] of global._songSearchCache.entries()) {
-                        if (entry.jid !== groupJid) continue;
-                        const match = entry.results.find(r => songTitle.includes(r.title.slice(0, 20)) || r.title.slice(0, 20).includes(songTitle.slice(0, 20)));
-                        if (match) { cachedResult = match; global._songSearchCache.delete(token); break; }
-                    }
-                }
-
-                logger.info(`[Poll] Song selected: ${songTitle}`);
-                const statusMsg = await sock.sendMessage(groupJid, { text: `⏳ Got it! Downloading *${songTitle}*...` });
-
-                (async () => {
-                    try {
-                        let result = cachedResult;
-                        if (!result) {
-                            const { searchYoutube } = require('../core/youtube');
-                            const results = await searchYoutube(songTitle, 1);
-                            if (!results?.length) throw new Error('Not found');
-                            result = results[0];
-                        }
-                        const execAsync = require('util').promisify(require('child_process').exec);
-                        const fsp = require('fs').promises;
-                        const tmpDir = path.join(__dirname, '../data/temp_media');
-                        fs.mkdirSync(tmpDir, { recursive: true });
-                        const outPath = path.join(tmpDir, `song_${Date.now()}.mp3`);
-                        const ytDlp = fs.existsSync('/usr/local/bin/yt-dlp') ? '/usr/local/bin/yt-dlp' : 'yt-dlp';
-                        const cookiesPath = path.join(__dirname, '../data/youtube_cookies.txt');
-                        const cookieArg = fs.existsSync(cookiesPath) ? `--cookies "${cookiesPath}"` : '';
-                        await execAsync(`${ytDlp} ${cookieArg} -x --audio-format mp3 --audio-quality 2 --max-filesize 48m --no-playlist --no-warnings -o "${outPath}" "${result.url}"`, { timeout: 120000 });
-                        if (fs.existsSync(outPath)) {
-                            const buf = await fsp.readFile(outPath);
-                            await sock.sendMessage(groupJid, { audio: buf, mimetype: 'audio/mpeg', ptt: false, fileName: `${result.title}.mp3` });
-                            fsp.unlink(outPath).catch(() => {});
-                            await sock.sendMessage(groupJid, { delete: statusMsg.key }).catch(() => {});
-                        }
-                    } catch (e) {
-                        await sock.sendMessage(groupJid, { text: `❌ Download failed: ${e.message.slice(0, 100)}` });
-                        await sock.sendMessage(groupJid, { delete: statusMsg.key }).catch(() => {});
-                    }
-                })();
+                await handleSongPollSelection(sock, groupJid, pollCreationKey || m.key?.id || '', selectedNames);
             } catch (e) {
                 logger.warn(`[Poll] Error: ${e.message}`);
             }
@@ -882,9 +1364,6 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                     else stickerId = Buffer.from(sha).toString('base64');
                 }
                 if (stickerId) {
-                    const bindDbPath = path.join(__dirname, '../data/stickerCmds.json');
-                    // Always reload to pick up new binds
-                    try { global._stickerCmdsCache = fs.existsSync(bindDbPath) ? JSON.parse(fs.readFileSync(bindDbPath, 'utf-8')) : {}; } catch { global._stickerCmdsCache = {}; }
                     const boundCmd = global._stickerCmdsCache[stickerId];
                     if (boundCmd) {
                         text = boundCmd;
@@ -925,13 +1404,13 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                             const execAsync = util.promisify(exec);
                             const fsp = require('fs').promises;
                             const tmpDir = path.join(__dirname, '../data/temp_media');
-                            fs.mkdirSync(tmpDir, { recursive: true });
+                            await fsp.mkdir(tmpDir, { recursive: true });
                             const outPath = path.join(tmpDir, `song_${Date.now()}.mp3`);
-                            const ytDlp = fs.existsSync('/usr/local/bin/yt-dlp') ? '/usr/local/bin/yt-dlp' : 'yt-dlp';
-                            const cookiesPath = path.join(__dirname, '../data/youtube_cookies.txt');
-                            const cookieArg = fs.existsSync(cookiesPath) ? `--cookies "${cookiesPath}"` : '';
-                            await execAsync(`${ytDlp} ${cookieArg} -x --audio-format mp3 --audio-quality 2 --max-filesize 48m --no-playlist --no-warnings -o "${outPath}" "${result.url}"`, { timeout: 120000 });
-                            if (fs.existsSync(outPath)) {
+                            const cookieArg = getYoutubeCookieArg();
+                            await execAsync(`${YT_DLP_BIN} ${cookieArg} -x --audio-format mp3 --audio-quality 2 --max-filesize 48m --no-playlist --no-warnings -o "${outPath}" "${result.url}"`, { timeout: 120000 });
+                            let fileReady = true;
+                            try { await fsp.access(outPath); } catch { fileReady = false; }
+                            if (fileReady) {
                                 const buf = await fsp.readFile(outPath);
                                 await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/mpeg', ptt: false, fileName: `${result.title}.mp3` }, { quoted: msg });
                                 fsp.unlink(outPath).catch(() => {});
@@ -1035,23 +1514,25 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
         const stickerCachedMsg = stickerCtxInfo?.stanzaId ? global.messageCache.get(stickerCtxInfo.stanzaId) : null;
         const isStickerReplyToBot = !!(stickerCtxInfo?.participant?.startsWith(botId)) || !!(stickerCachedMsg?.key?.fromMe);
 
-        // AI responds in groups when mentioned/replied; stickers can also trigger AI flow.
-        // In DM, pappy mode (if enabled for that chat) can respond naturally.
-        // "pappy" keyword trigger — works in any chat even without .pappy on
-        // hasPappyTrigger only works when pappy mode is ON or in DM
-        const hasPappyTrigger = !msg.key.fromMe && /\bpappy\b/i.test(text) && (pappyOn || !isGroup);
+        // Explicit mention/reply triggers always work in groups.
+        // Keyword trigger "pappy" follows .pappy mode state so OFF truly disables it.
+        const hasPappyTrigger = pappyOn && !msg.key.fromMe && /\bpappy\b/i.test(text);
+        const explicitGroupTrigger = isMentioned || isReplyToBot || isStickerReplyToBot || hasPappyTrigger;
+        const ambientGroupTrigger = pappyOn && (hasSticker || !!String(text || '').trim());
 
         const shouldRespond = !msg.key.fromMe && (
-            // In groups: respond to mentions and replies always, pappy keyword only if mode ON
-            (isGroup && (isMentioned || isReplyToBot || isStickerReplyToBot || hasPappyTrigger)) ||
-            // Pappy mode ON: respond to everything in the group
-            (pappyOn && isGroup) ||
-            // DM: only owner/node owner
+            (isGroup && (explicitGroupTrigger || ambientGroupTrigger)) ||
             (!isGroup && isOwnerJidForSession(sender, phoneNumber))
         );
         
         if (shouldRespond && !text.startsWith(globalPrefix)) {
             const msgId = msg.key.id || '';
+            const senderCooldownKey = `${sessionKey}:${String(sender || '').replace(/:\d+(?=@)/g, '')}`;
+            if (!global._aiUserCooldown) global._aiUserCooldown = new Map();
+            const lastUserAiAt = Number(global._aiUserCooldown.get(senderCooldownKey) || 0);
+            if (Date.now() - lastUserAiAt < AI_USER_COOLDOWN_MS) return;
+            global._aiUserCooldown.set(senderCooldownKey, Date.now());
+
             // Dedup check — skip if same message already queued
             if (!canAiReply(msgId)) return;
 
@@ -1061,11 +1542,11 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
             logger.info(`[AI] Queued - Sticker: ${hasSticker}, Mentioned: ${isMentioned}, Reply: ${isReplyToBot}`);
 
             // Push into per-session queue — 1 AI call at a time per node
-            // If queue is backed up (>3 tasks), drop oldest to stay responsive
+            // If queue is backed up, drop this request to protect command responsiveness.
             const aiQ = getAiQueue(sessionKey);
-            if (aiQ.length() > 3) {
-                logger.warn(`[AI] Queue backed up for ${sessionKey}, dropping oldest task`);
-                aiQ.kill();
+            if (aiQ.length() >= AI_MAX_QUEUE_SIZE) {
+                logger.warn(`[AI] Queue overloaded for ${sessionKey} (${aiQ.length()}) — dropping new AI task`);
+                return;
             }
             aiQ.push(async () => {
                 try {
@@ -1368,56 +1849,20 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 if (!update.update?.pollUpdates) continue;
                 const pollVote = update.update.pollUpdates[0];
                 if (!pollVote) continue;
-                const votedOption = pollVote.vote?.selectedOptions?.[0];
-                if (!votedOption) continue;
-
-                const voter = update.key?.participant || update.key?.remoteJid;
                 const groupJid = update.key?.remoteJid;
 
-                // Find matching song search cache
-                if (!global._songSearchCache?.size) continue;
-                for (const [token, entry] of global._songSearchCache.entries()) {
-                    if (entry.jid !== groupJid) continue;
-                    // Match voted option to result
-                    const idx = entry.results.findIndex(r =>
-                        votedOption.includes(r.title.slice(0, 30))
-                    );
-                    if (idx === -1) continue;
-                    const result = entry.results[idx];
-                    global._songSearchCache.delete(token);
+                const pollCreationKey = pollVote.pollCreationMessageKey?.id || update.key?.id;
+                const cachedPoll = global.messageCache?.get(pollCreationKey);
+                if (!cachedPoll) continue;
+                const pollName = cachedPoll?.message?.pollCreationMessageV3?.name || cachedPoll?.message?.pollCreationMessage?.name || '';
+                if (!pollName.includes('Pick a song')) continue;
 
-                    const statusMsg = await sock.sendMessage(groupJid, {
-                        text: `🎵 *${result.title}*\n⏳ Downloading...`
-                    });
-                    try {
-                        const { exec } = require('child_process');
-                        const util = require('util');
-                        const execAsync = util.promisify(exec);
-                        const fsp = require('fs').promises;
-                        const tmpDir = path.join(__dirname, '../data/temp_media');
-                        fs.mkdirSync(tmpDir, { recursive: true });
-                        const outPath = path.join(tmpDir, `song_${Date.now()}.mp3`);
-                        const ytDlp = fs.existsSync('/usr/local/bin/yt-dlp') ? '/usr/local/bin/yt-dlp' : 'yt-dlp';
-                        const cookiesPath = path.join(__dirname, '../data/youtube_cookies.txt');
-                        const cookieArg = fs.existsSync(cookiesPath) ? `--cookies "${cookiesPath}"` : '';
-                        await execAsync(
-                            `${ytDlp} ${cookieArg} -x --audio-format mp3 --audio-quality 2 --max-filesize 48m --no-playlist --no-warnings -o "${outPath}" "${result.url}"`,
-                            { timeout: 120000 }
-                        );
-                        if (fs.existsSync(outPath)) {
-                            const buf = await fsp.readFile(outPath);
-                            await sock.sendMessage(groupJid, {
-                                audio: buf, mimetype: 'audio/mpeg', ptt: false,
-                                fileName: `${result.title}.mp3`
-                            });
-                            fsp.unlink(outPath).catch(() => {});
-                            await sock.sendMessage(groupJid, { delete: statusMsg.key }).catch(() => {});
-                        }
-                    } catch (e) {
-                        await sock.sendMessage(groupJid, { text: `❌ Download failed: ${e.message.slice(0, 100)}` });
-                    }
-                    break;
-                }
+                const selectedNames = (await resolveSongPollSelections(pollVote, cachedPoll))
+                    .map((name) => String(name || '').replace(/\s*\[.*?\]\s*$/, '').trim())
+                    .filter(Boolean);
+                if (!selectedNames.length) continue;
+
+                await handleSongPollSelection(sock, groupJid, pollCreationKey || update.key?.id || '', selectedNames);
             } catch {}
         }
     });
@@ -1425,82 +1870,68 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
     // ── POLL VOTE HANDLER — poll votes come as pollUpdateMessage in messages.upsert ──
     sock.ev.on('messages.upsert', async ({ messages: pollMsgs, type: pollType }) => {
         if (pollType !== 'notify') return;
-        if (pollType !== 'notify') return;
         for (const pollMsg of pollMsgs) {
             try {
                 const pollUpdate = pollMsg.message?.pollUpdateMessage;
                 if (!pollUpdate) continue;
-                if (!global._songSearchCache?.size) continue;
                 const groupJid = pollMsg.key?.remoteJid;
-                const voter = pollMsg.key?.participant || pollMsg.key?.remoteJid;
+                const pollCreationMsgKey = pollUpdate.pollCreationMessageKey;
+                const cachedPoll = global.messageCache?.get(pollCreationMsgKey?.id);
+                const pollName = cachedPoll?.message?.pollCreationMessageV3?.name || cachedPoll?.message?.pollCreationMessage?.name || '';
+                if (!pollName.includes('Pick a song')) continue;
 
-                // Decrypt voted options
-                const { getAggregateVotesInPollMessage } = require('gifted-baileys');
-                let votedOptions = [];
-                try {
-                    const pollCreationMsgKey = pollUpdate.pollCreationMessageKey;
-                    // Find the original poll message to get encKey
-                    const cachedPoll = global.messageCache?.get(pollCreationMsgKey?.id);
-                    if (cachedPoll?.message?.pollCreationMessage) {
-                        const encKey = cachedPoll.message.pollCreationMessage.encKey;
-                        const votes = await getAggregateVotesInPollMessage({
-                            message: cachedPoll.message,
-                            pollUpdates: [pollMsg.message.pollUpdateMessage],
-                        }, encKey);
-                        votedOptions = votes.filter(v => v.voters?.length > 0).map(v => v.name);
-                    }
-                } catch {
-                    // Fallback: try to get option from raw selectedOptions hash
-                    votedOptions = pollUpdate.vote?.selectedOptions?.map(o => Buffer.from(o).toString('utf8').replace(/[^\x20-\x7E]/g, '')) || [];
-                }
+                const selectedNames = (await resolveSongPollSelections(pollUpdate, cachedPoll))
+                    .map((name) => String(name || '').replace(/\s*\[.*?\]\s*$/, '').trim())
+                    .filter(Boolean);
+                if (!selectedNames.length) continue;
 
-                if (!votedOptions.length) continue;
-
-                for (const [token, entry] of global._songSearchCache.entries()) {
-                    if (entry.jid !== groupJid) continue;
-                    const votedText = votedOptions[0] || '';
-                    const idx = entry.results.findIndex(r => votedText.includes(r.title.slice(0, 20)) || r.title.slice(0, 20).includes(votedText.slice(0, 20)));
-                    if (idx === -1) continue;
-                    const result = entry.results[idx];
-                    global._songSearchCache.delete(token);
-
-                    // Heads up message
-                    const statusMsg = await sock.sendMessage(groupJid, {
-                        text: `⏳ Got it! Downloading *${result.title}*...\n🎵 Sending shortly`
-                    });
-                    try {
-                        const execAsync = require('util').promisify(require('child_process').exec);
-                        const fsp = require('fs').promises;
-                        const tmpDir = path.join(__dirname, '../data/temp_media');
-                        fs.mkdirSync(tmpDir, { recursive: true });
-                        const outPath = path.join(tmpDir, `song_${Date.now()}.mp3`);
-                        const ytDlp = fs.existsSync('/usr/local/bin/yt-dlp') ? '/usr/local/bin/yt-dlp' : 'yt-dlp';
-                        const cookiesPath = path.join(__dirname, '../data/youtube_cookies.txt');
-                        const cookieArg = fs.existsSync(cookiesPath) ? `--cookies "${cookiesPath}"` : '';
-                        await execAsync(`${ytDlp} ${cookieArg} -x --audio-format mp3 --audio-quality 2 --max-filesize 48m --no-playlist --no-warnings -o "${outPath}" "${result.url}"`, { timeout: 120000 });
-                        if (fs.existsSync(outPath)) {
-                            const buf = await fsp.readFile(outPath);
-                            await sock.sendMessage(groupJid, { audio: buf, mimetype: 'audio/mpeg', ptt: false, fileName: `${result.title}.mp3` });
-                            fsp.unlink(outPath).catch(() => {});
-                            await sock.sendMessage(groupJid, { delete: statusMsg.key }).catch(() => {});
-                        }
-                    } catch (e) {
-                        await sock.sendMessage(groupJid, { text: `❌ Download failed: ${e.message.slice(0, 100)}` });
-                        await sock.sendMessage(groupJid, { delete: statusMsg.key }).catch(() => {});
-                    }
-                    break;
-                }
+                await handleSongPollSelection(sock, groupJid, pollCreationMsgKey?.id || pollMsg.key?.id || '', selectedNames);
             } catch {}
         }
     });
 
     sock.ev.on('groups.update', (updates) => {
-        for (const update of updates) {
-            if (update.id) groupCache.invalidate(update.id);
+        if (!global._groupInvalidateQueues) global._groupInvalidateQueues = new Map();
+        const key = sessionKey;
+        let state = global._groupInvalidateQueues.get(key);
+        if (!state) {
+            state = { ids: new Set(), timer: null };
+            global._groupInvalidateQueues.set(key, state);
         }
+        for (const update of updates) {
+            if (update.id) state.ids.add(update.id);
+        }
+        if (state.timer) return;
+        state.timer = setTimeout(() => {
+            try {
+                for (const jid of state.ids) groupCache.invalidate(jid, sock);
+            } finally {
+                state.ids.clear();
+                state.timer = null;
+            }
+        }, 1000);
+        state.timer.unref?.();
     });
     sock.ev.on('group-participants.update', ({ id }) => {
-        if (id) groupCache.invalidate(id);
+        if (!id) return;
+        if (!global._groupInvalidateQueues) global._groupInvalidateQueues = new Map();
+        const key = sessionKey;
+        let state = global._groupInvalidateQueues.get(key);
+        if (!state) {
+            state = { ids: new Set(), timer: null };
+            global._groupInvalidateQueues.set(key, state);
+        }
+        state.ids.add(id);
+        if (state.timer) return;
+        state.timer = setTimeout(() => {
+            try {
+                for (const jid of state.ids) groupCache.invalidate(jid, sock);
+            } finally {
+                state.ids.clear();
+                state.timer = null;
+            }
+        }, 1000);
+        state.timer.unref?.();
     });
 
     return sock;

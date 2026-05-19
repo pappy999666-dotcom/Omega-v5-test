@@ -64,6 +64,86 @@ function extractUrls(text) {
 
 function isAbsoluteUrl(url) { return /^https?:\/\//i.test(url); }
 
+// ─── LINK VALIDATION ENGINE ─────────────────────────────────────────────────
+async function isLinkValid(url, type = 'generic', sock = null) {
+    if (!url || typeof url !== 'string') return false;
+    
+    try {
+        // WhatsApp group invite validation
+        if (type === 'whatsapp' || /chat\.whatsapp\.com/.test(url)) {
+            const code = url.split('chat.whatsapp.com/')[1]?.split(/[?#]/)[0];
+            if (!code) return false;
+            
+            // If socket available, validate via groupGetInviteInfo
+            if (sock && typeof sock.groupGetInviteInfo === 'function') {
+                try {
+                    const info = await sock.groupGetInviteInfo(code);
+                    // Valid if we got group info back
+                    return !!(info?.id);
+                } catch (e) {
+                    // Invalid if we got specific errors
+                    const msg = String(e.message || '').toLowerCase();
+                    if (msg.includes('not-found') || msg.includes('expired') || msg.includes('invalid')) {
+                        return false;
+                    }
+                    // For other errors, assume valid (network issue) and retry later
+                    return true;
+                }
+            }
+            // Fallback: regex-based code validation
+            return /^[0-9A-Za-z]{20,24}$/.test(code);
+        }
+        
+        // Generic HTTP URL validation - check HEAD response
+        if (type === 'url' || /^https?:\/\//.test(url)) {
+            try {
+                const res = await axios.head(url, { 
+                    timeout: 8000, 
+                    maxRedirects: 3,
+                    headers: { 'User-Agent': pickUA() },
+                    validateStatus: () => true // accept all status codes
+                });
+                const status = res?.status || 0;
+                // Valid if 2xx or 3xx (redirect)
+                return status >= 200 && status < 400;
+            } catch (e) {
+                // Network errors = assume valid (may be temporarily down)
+                const msg = String(e.message || '').toLowerCase();
+                if (msg.includes('timeout') || msg.includes('econnrefused') || msg.includes('enotfound')) {
+                    // Temporary network issue - treat as valid for now
+                    return true;
+                }
+                // Certificate/SSL errors = assume valid
+                if (msg.includes('certificate') || msg.includes('ssl') || msg.includes('ecer')) {
+                    return true;
+                }
+                return false;
+            }
+        }
+        
+        return true; // Default: assume valid if type unknown
+    } catch (err) {
+        logger.warn(`[LinkValidation] Error validating ${url}: ${err.message}`);
+        return true; // Default to valid on error (don't break autojoin)
+    }
+}
+
+// Batch validate links and return only valid ones
+async function validateLinks(links, sock = null) {
+    if (!Array.isArray(links)) return [];
+    const results = await Promise.allSettled(
+        links.map(url => isLinkValid(url, 'whatsapp', sock))
+    );
+    return links.filter((_, i) => results[i]?.value === true);
+}
+
+// Cleanup intel DB: remove invalid links from a group entry
+async function cleanupGroupLinks(groupJid, groupLinks, sock = null) {
+    if (!Array.isArray(groupLinks) || !groupLinks.length) return [];
+    const valid = await validateLinks(groupLinks, sock);
+    return valid;
+}
+
 function resolveUrl(base, relative) {
     try { return isAbsoluteUrl(relative) ? relative : new URL(relative, base).href; } catch { return null; }
 }
@@ -325,4 +405,4 @@ async function normalizeThumbnailBuffer(input) {
 function rememberPreviewHint() {}
 function getPreviewHint() { return null; }
 
-module.exports = { buildLinkPreview, buildNativeLinkPreview, extractUrls, createContextInfo, fetchImageBuffer, normalizeThumbnailBuffer, rememberPreviewHint, getPreviewHint };
+module.exports = { buildLinkPreview, buildNativeLinkPreview, extractUrls, createContextInfo, fetchImageBuffer, normalizeThumbnailBuffer, rememberPreviewHint, getPreviewHint, isLinkValid, validateLinks, cleanupGroupLinks };

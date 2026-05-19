@@ -9,17 +9,19 @@ const logger = require('./core/logger');
 const { ownerTelegramId } = require('./config');
 const watchdog = require('./core/watchdog');
 const { connectDB } = require('./core/database'); // 👈 NEW: Importing our database connector
+const crashGuard = require('./core/stability/crashGuard');
+const healthMonitor = require('./core/stability/healthMonitor');
+const sessionRepair = require('./core/stability/sessionRepair');
+const tempCleaner = require('./core/stability/tempCleaner');
+const { getKernel } = require('./core/runtimeKernel');
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// 🛡️ ZERO-CRASH TOLERANCE
-process.on('uncaughtException', (err) => {
-    logger.error(`[CRASH PREVENTED] Uncaught Exception: ${err?.message || err}`);
-    if (err?.stack) logger.error(err.stack.split('\n').slice(0, 4).join(' | '));
-});
-process.on('unhandledRejection', (reason) => {
-    const msg = reason instanceof Error ? reason.message : String(reason || 'unknown');
-    logger.error(`[CRASH PREVENTED] Unhandled Rejection: ${msg}`);
-    if (reason?.stack) logger.error(reason.stack.split('\n').slice(0, 4).join(' | '));
+// 🛡️ ENTERPRISE CRASH GUARD
+crashGuard.install();
+crashGuard.registerShutdown('stability-services', async () => {
+    try { healthMonitor.stop(); } catch {}
+    try { tempCleaner.stop(); } catch {}
+    try { getKernel({ logger, engine: require('./core/engine') }).shutdown('crash-guard'); } catch {}
 });
 
 // Suppress gifted-baileys internal signal session console.log spam
@@ -27,50 +29,27 @@ process.on('unhandledRejection', (reason) => {
 const _origLog = console.log.bind(console);
 // Do NOT override console.log — it breaks Baileys internal event handling
 
-
-process.on('SIGINT', async () => {
-    logger.warn('Shutting down safely... clearing queues.');
-    process.exit(0);
-});
-
-// 🧹 GHOST SWEEPER PROTOCOL
-function sweepGhostSessions(sessionsDir) {
-    if (!fs.existsSync(sessionsDir)) return;
-    const sessions = fs.readdirSync(sessionsDir);
-    let nukedCount = 0;
-
-    for (const folder of sessions) {
-        const folderPath = path.join(sessionsDir, folder);
-        if (!fs.statSync(folderPath).isDirectory()) continue;
-
-        const credsPath = path.join(folderPath, 'creds.json');
-        let isCorrupted = false;
-
-        if (!fs.existsSync(credsPath)) {
-            isCorrupted = true;
-        } else {
-            try {
-                const fileData = fs.readFileSync(credsPath, 'utf-8');
-                if (!fileData || fileData.trim() === '') isCorrupted = true;
-                else JSON.parse(fileData);
-            } catch (e) { isCorrupted = true; }
-        }
-
-        if (isCorrupted) {
-            try {
-                fs.rmSync(folderPath, { recursive: true, force: true });
-                logger.warn(`🗑️ Swept corrupted ghost session: ${folder}`);
-                nukedCount++;
-            } catch (err) { logger.error(`Failed to delete ghost session ${folder}:`, err); }
-        }
+async function isBootableSessionDir(sessionsDir, folder) {
+    const full = path.join(sessionsDir, folder);
+    if (!fs.existsSync(full)) return false;
+    try {
+        if (!fs.statSync(full).isDirectory()) return false;
+    } catch {
+        return false;
     }
-    if (nukedCount > 0) logger.success(`🧹 Ghost Sweeper destroyed ${nukedCount} dead session(s).`);
+    const result = await sessionRepair.validateCredentials(folder);
+    return result.valid && result.registered === true;
 }
 
 async function bootEliteOperator() {
     try {
+        const kernel = getKernel({ logger, engine: require('./core/engine') });
+        kernel.start();
         console.clear();
         logger.info('🚀 IGNITING PAPPY ULTIMATE ENGINE...');
+
+        tempCleaner.start();
+        healthMonitor.start();
 
         // 👈 NEW: Connect to our new MongoDB fortress first!
         await connectDB();
@@ -88,9 +67,18 @@ async function bootEliteOperator() {
         if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir, { recursive: true });
         
         logger.info('🔍 Running pre-flight diagnostics...');
-        sweepGhostSessions(sessionsDir);
+        // Never delete session dirs during boot; only validate/prune safely.
+        await sessionRepair.sweepGhostSessions({ destructive: false });
+        await sessionRepair.runFullAudit();
 
-        const validSessions = fs.readdirSync(sessionsDir).filter(file => fs.statSync(path.join(sessionsDir, file)).isDirectory());
+        const allSessionEntries = fs.readdirSync(sessionsDir);
+        const sessionChecks = await Promise.all(
+            allSessionEntries.map(async (file) => ({
+                file,
+                bootable: await isBootableSessionDir(sessionsDir, file),
+            }))
+        );
+        const validSessions = sessionChecks.filter((x) => x.bootable).map((x) => x.file);
 
         if (validSessions.length === 0) {
             logger.info('⚠️ No saved sessions found. Use /pair in Telegram to link a bot.');

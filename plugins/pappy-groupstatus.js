@@ -111,6 +111,8 @@ function setScopedGsConfig(scope, patch) {
 }
 const yieldLoop = () => new Promise(resolve => setImmediate(resolve));
 const QUEUE_CHUNK_SIZE = 100; // reduced from 300 to avoid Redis overload
+const STATUS_JOB_ATTEMPTS = Math.max(1, Number(process.env.STATUS_JOB_ATTEMPTS || 8));
+const STATUS_JOB_BACKOFF_MS = Math.max(1500, Number(process.env.STATUS_JOB_BACKOFF_MS || 12000));
 
 async function resolveTargetJids(sock, chat, commandName) {
     if (commandName === '.ggstatus') {
@@ -150,7 +152,14 @@ async function enqueueStatusJobs({ targetJids, amount, botId, textContent, media
                     sourceMessage: !mediaPath ? relaySourceMessage : null,
                     sourceContextInfo: !mediaPath ? relaySourceContextInfo : null
                 },
-                opts: { removeOnComplete: true, removeOnFail: 1000, priority: 2 }
+                opts: {
+                    removeOnComplete: true,
+                    removeOnFail: 1000,
+                    priority: 2,
+                    // Keep retries inside worker logic for strict per-group completion ordering.
+                    attempts: 1,
+                    backoff: { type: 'exponential', delay: STATUS_JOB_BACKOFF_MS },
+                }
             });
             totalJobs++;
 
@@ -200,6 +209,7 @@ module.exports = {
     category: 'STATUS',
     commands: [
         { cmd: '.updategstatus', role: 'admin' },
+        { cmd: '.updatgstatus', role: 'admin' },
         { cmd: '.gstatus', role: 'owner' },
         { cmd: '.ggstatus', role: 'owner' }
     ],
@@ -218,7 +228,9 @@ module.exports = {
             const chat = msg.key.remoteJid;
             // Normalize: handle ". updategstatus" (space after dot) from mobile autocorrect
             const rawText = String(text || '').replace(/^\.\ +/, '.').trim();
-            const commandName = rawText.split(' ')[0].toLowerCase();
+            let commandName = rawText.split(' ')[0].toLowerCase();
+            // Common typo alias support
+            if (commandName === '.updatgstatus') commandName = '.updategstatus';
             const cleanArgs = rawText.slice(commandName.length).trim().split(/\s+/).filter(Boolean);
 
             if (commandName === '.ggstatus') {
@@ -275,6 +287,13 @@ module.exports = {
                 } catch (err) {
                     return sock.sendMessage(chat, { text: `❌ Failed to fetch groups: ${err.message}` });
                 }
+            }
+
+            targetJids = (targetJids || []).filter(Boolean);
+            if (!Array.isArray(targetJids) || targetJids.length === 0) {
+                return sock.sendMessage(chat, {
+                    text: '⚠️ No target groups found for this status command right now.'
+                });
             }
 
             let mediaPath = null;

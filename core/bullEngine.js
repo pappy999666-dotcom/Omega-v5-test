@@ -39,30 +39,74 @@ const delay = (ms) => new Promise(res => setTimeout(res, ms));
 const OFFLINE_SOCKET_TTL_MS = 30 * 1000;
 const OFFLINE_RETRY_HOLD_MS = 20 * 1000;
 const offlineSocketCache = new Map();
-const laneLocks = new Map();
 
-async function runInLane(laneKey, workFn) {
-    const key = String(laneKey || 'default');
-    const previous = laneLocks.get(key) || Promise.resolve();
-    const current = previous
-        .catch(() => {})
-        .then(async () => workFn());
-
-    laneLocks.set(key, current.finally(() => {
-        if (laneLocks.get(key) === current) {
-            laneLocks.delete(key);
-        }
-    }));
-
-    return current;
-}
+const WORKER_CONCURRENCY = {
+    godcast: Math.max(1, Number(process.env.BULL_CONCURRENCY_GODCAST || 1)),
+    status:  Math.max(1, Number(process.env.BULL_CONCURRENCY_STATUS || 1)),
+    gcast:   Math.max(1, Number(process.env.BULL_CONCURRENCY_GCAST || 2)),
+    default: Math.max(1, Number(process.env.BULL_CONCURRENCY_DEFAULT || 3)),
+};
 
 const GHOST_SEND_DELAY_MS = 800;    // increased
 const GHOST_DELETE_DELAY_MS = 1000;  // increased
 const GHOST_RETRY_DELAY_MS = 2000;
-const GHOST_PRE_STATUS_SETTLE_MS = 800;
+const GHOST_PRE_STATUS_SETTLE_MS = Math.max(800, Number(process.env.BULL_GHOST_PRE_STATUS_SETTLE_MS || 1800));
 const INTER_JOB_DELAY_MS = 1500;     // delay between each group send
 const MAX_STATUS_THUMB_BYTES = 45 * 1024;
+const GODCAST_POST_DELAY_MS = Math.max(1500, Number(process.env.BULL_GODCAST_POST_DELAY_MS || 4500));
+const STATUS_POST_DELAY_MS = Math.max(1000, Number(process.env.BULL_STATUS_POST_DELAY_MS || 2500));
+const GCAST_POST_DELAY_MS = Math.max(400, Number(process.env.BULL_GCAST_POST_DELAY_MS || 900));
+const POST_DELAY_JITTER_MS = Math.max(0, Number(process.env.BULL_POST_DELAY_JITTER_MS || 1000));
+const FAILURE_POST_DELAY_MS = Math.max(500, Number(process.env.BULL_FAILURE_POST_DELAY_MS || 1500));
+const DRAIN_DELAY_GODCAST_MS = Math.max(300, Number(process.env.BULL_DRAIN_DELAY_GODCAST_MS || 1400));
+const DRAIN_DELAY_STATUS_MS = Math.max(200, Number(process.env.BULL_DRAIN_DELAY_STATUS_MS || 700));
+const DRAIN_DELAY_DEFAULT_MS = Math.max(100, Number(process.env.BULL_DRAIN_DELAY_DEFAULT_MS || 400));
+const SEND_RETRY_BASE_MS = Math.max(1000, Number(process.env.BULL_SEND_RETRY_BASE_MS || 6000));
+const SEND_RETRY_JITTER_MS = Math.max(0, Number(process.env.BULL_SEND_RETRY_JITTER_MS || 2500));
+const SEND_ATTEMPTS_STATUS = Math.max(1, Number(process.env.BULL_SEND_ATTEMPTS_STATUS || 6));
+const SEND_ATTEMPTS_GODCAST = Math.max(1, Number(process.env.BULL_SEND_ATTEMPTS_GODCAST || 7));
+const SEND_ATTEMPTS_GCAST = Math.max(1, Number(process.env.BULL_SEND_ATTEMPTS_GCAST || 4));
+const SEND_ATTEMPTS_STATUS_FALLBACK = Math.max(1, Number(process.env.BULL_SEND_ATTEMPTS_STATUS_FALLBACK || 5));
+const SEND_ATTEMPTS_LARGE_GROUP = Math.max(1, Number(process.env.BULL_SEND_ATTEMPTS_LARGE_GROUP || 15));
+const LARGE_GROUP_POST_DELAY_MS = Math.max(2000, Number(process.env.BULL_POST_DELAY_LARGE_GROUP_MS || 5000));
+const LARGE_GROUP_RETRY_BASE_MS = Math.max(1500, Number(process.env.BULL_RETRY_BASE_LARGE_GROUP_MS || 9000));
+
+function isPermanentAccessError(errMsg) {
+    const msg = String(errMsg || '').toLowerCase();
+    return (
+        msg.includes('not-authorized') ||
+        msg.includes('not authorized') ||
+        msg.includes('forbidden') ||
+        msg.includes('403') ||
+        msg.includes('not a participant') ||
+        msg.includes('not participant') ||
+        msg.includes('you are not a participant') ||
+        msg.includes('participant not found') ||
+        msg.includes('blocked') ||
+        msg.includes('rejected')
+    );
+}
+
+function isRetryableSendError(errMsg) {
+    const msg = String(errMsg || '').toLowerCase();
+    return (
+        msg.includes('timeout') ||
+        msg.includes('timed out') ||
+        msg.includes('connection') ||
+        msg.includes('socket') ||
+        msg.includes('stream') ||
+        msg.includes('restart required') ||
+        msg.includes('disconnected') ||
+        msg.includes('unavailable') ||
+        msg.includes('temporarily') ||
+        msg.includes('rate-overlimit') ||
+        msg.includes('429') ||
+        msg.includes('too many') ||
+        msg.includes('econnreset') ||
+        msg.includes('etimedout') ||
+        msg.includes('eai_again')
+    );
+}
 
 function resolveSocketForBot(botId) {
     let sock = global.waSockByBotId?.get(String(botId || '')) || null;
@@ -226,39 +270,16 @@ async function buildStatusPayloadFromSourceMessage(sourceMessage, sourceContextI
     const statusBg   = normalizeStatusBackgroundColor(backgroundColor);
     // Use fallbackText (aesthetic-wrapped text from godcast) as display text if provided
     // Fall back to the original extendedTextMessage text only if no fallback given
-    const extText = fallbackText || revived?.extendedTextMessage?.text || revived?.conversation || '';
-
-    // EXACT RELAY: pass the extendedTextMessage object untouched into groupStatusMessage.message
-    // WA uses it to render the native link card. Display text uses the aesthetic-wrapped version.
+    const extText = fallbackText || revived?.extendedTextMessage?.text || revived?.conversation || '';    // EXACT RELAY: pass extendedTextMessage through groupStatusMessage.message like .tag
+    // so WA can render the native card from the original message payload.
     if (revived?.extendedTextMessage) {
         const ext = revived.extendedTextMessage;
-        const targetUrl = ext.matchedText || ext.canonicalUrl || '';
-        // Build highQualityThumbnail from directPath fields so generateWAMessage renders full card
-        const highQualityThumbnail = (ext.thumbnailDirectPath && ext.mediaKey) ? {
-            directPath:        ext.thumbnailDirectPath,
-            mediaKey:          ext.mediaKey,
-            mediaKeyTimestamp: ext.mediaKeyTimestamp,
-            fileSha256:        ext.thumbnailSha256,
-            fileEncSha256:     ext.thumbnailEncSha256,
-            width:             ext.thumbnailWidth  || 300,
-            height:            ext.thumbnailHeight || 300,
-        } : null;
         return {
             groupStatusMessage: {
-                text: extText,
-                font: statusFont,
-                backgroundColor: statusBg,
                 message: {
-                    text: extText,
-                    linkPreview: {
-                        'matched-text':      targetUrl,
-                        matchedText:         targetUrl,
-                        canonicalUrl:        targetUrl,
-                        title:               ext.title || '',
-                        description:         ext.description || '',
-                        previewType:         0,
-                        ...(highQualityThumbnail ? { highQualityThumbnail } : {}),
-                        ...(ext.jpegThumbnail ? { jpegThumbnail: ext.jpegThumbnail } : {}),
+                    extendedTextMessage: {
+                        ...ext,
+                        text: extText || ext.text || '',
                     }
                 }
             }
@@ -287,18 +308,14 @@ async function buildStatusPayloadFromSourceMessage(sourceMessage, sourceContextI
 
     return {
         groupStatusMessage: {
-            text: extText,
-            font: statusFont,
-            backgroundColor: statusBg,
             message: {
-                text: extText,
-                linkPreview: {
-                    'matched-text': targetUrl,
-                    matchedText:    targetUrl,
-                    canonicalUrl:   targetUrl,
+                extendedTextMessage: {
+                    text: extText,
+                    matchedText: targetUrl,
+                    canonicalUrl: targetUrl,
                     title,
                     description,
-                    previewType:    0,
+                    previewType: 0,
                     ...(thumb ? { jpegThumbnail: thumb } : {}),
                 }
             }
@@ -381,13 +398,17 @@ function getQueueFromJobData(data) {
 }
 
 async function processBroadcastJob(job) {
-    const { botId, targetJid, textContent, mode, useGhostProtocol, font, backgroundColor, mediaPath, isVideo, sourceMessage, sourceContextInfo, commandType } = job.data;
+    const { botId, targetJid, textContent, mode, useGhostProtocol, font, backgroundColor, mediaPath, isVideo, sourceMessage, sourceContextInfo, commandType, groupSize } = job.data;
     const executeJob = async () => {
         const jobStartedAt = Date.now();
         let ghostDurationMs = 0;
         let previewDurationMs = 0;
         let sendDurationMs = 0;
         let usedLinkPreview = false;
+        const largeGroupThreshold = Math.max(50, Number(process.env.GODCAST_LARGE_GROUP_THRESHOLD || 200));
+        const isLargeGroup = Number(groupSize || 0) >= largeGroupThreshold;
+        const largeGroupSendTimeoutMs = Math.max(25000, Number(process.env.BULL_SEND_TIMEOUT_LARGE_GROUP_MS || 40000));
+        const sendTimeoutMs = isLargeGroup ? largeGroupSendTimeoutMs : 25000;
 
         const offlineTs = offlineSocketCache.get(botId);
         if (offlineTs && Date.now() - offlineTs < OFFLINE_SOCKET_TTL_MS) {
@@ -479,7 +500,8 @@ async function processBroadcastJob(job) {
                 const sourcedPayload = await buildStatusPayloadFromSourceMessage(sourceMessage, sourceContextInfo, mutatedText, font, backgroundColor);
                 if (sourcedPayload) {
                     payload = sourcedPayload;
-                    if (payload?.groupStatusMessage?.matchedText || payload?.groupStatusMessage?.title || payload?.groupStatusMessage?.jpegThumbnail) {
+                    const ext = payload?.groupStatusMessage?.message?.extendedTextMessage;
+                    if (ext?.matchedText || ext?.canonicalUrl || ext?.title || ext?.jpegThumbnail) {
                         usedLinkPreview = true;
                     }
                 } else {
@@ -492,7 +514,7 @@ async function processBroadcastJob(job) {
                     };
                 }
             } else {
-                const urls = extractUrls(mutatedText);
+                    const urls = extractUrls(mutatedText);
                 if (urls.length > 0) {
                     // Build preview ourselves — gifted-baileys' getUrlInfo gets rate-limited on
                     // chat.whatsapp.com links. We inject a pre-built extendedTextMessage with
@@ -548,21 +570,17 @@ async function processBroadcastJob(job) {
                         }
                     } catch {}
 
-                    // { text, linkPreview } — correct format for generateWAMessage
+                    // Build as extendedTextMessage payload, same rendering family as .tag relay.
                     payload = {
                         groupStatusMessage: {
-                            text: mutatedText,
-                            font: statusFont,
-                            backgroundColor: statusBg,
                             message: {
-                                text: mutatedText,
-                                linkPreview: {
-                                    'matched-text': targetUrl,
-                                    matchedText:    targetUrl,
-                                    canonicalUrl:   targetUrl,
-                                    title:          previewTitle,
-                                    description:    previewDescription,
-                                    previewType:    0,
+                                extendedTextMessage: {
+                                    text: mutatedText,
+                                    matchedText: targetUrl,
+                                    canonicalUrl: targetUrl,
+                                    title: previewTitle,
+                                    description: previewDescription,
+                                    previewType: 0,
                                     ...(previewThumb ? { jpegThumbnail: previewThumb } : {}),
                                 }
                             }
@@ -655,8 +673,37 @@ async function processBroadcastJob(job) {
         // ─── 6. ENCRYPTED DELIVERY ────────────────
         // By using standard sendMessage, Baileys perfectly encrypts the GC Status so it NEVER turns invisible!
         const sendStartedAt = Date.now();
+        const sendPayloadWithRetry = async (payloadToSend, maxAttempts, stage) => {
+            let lastErr = null;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    await withTimeout(sock.sendMessage(targetJid, payloadToSend), sendTimeoutMs);
+                    return;
+                } catch (err) {
+                    lastErr = err;
+                    const errMsg = String(err.message || err).toLowerCase();
+                    if (isPermanentAccessError(errMsg)) throw err;
+                    if (!isRetryableSendError(errMsg) || attempt >= maxAttempts) throw err;
+
+                    const retryBase = isLargeGroup ? LARGE_GROUP_RETRY_BASE_MS : SEND_RETRY_BASE_MS;
+                    const waitMs = (retryBase * attempt) + Math.floor(Math.random() * (SEND_RETRY_JITTER_MS + 1));
+                    logger.warn(`[QueueRetry] ${stage} retry ${attempt}/${maxAttempts} for ${targetJid} in ${waitMs}ms: ${err.message}`);
+                    await delay(waitMs);
+                    sock = resolveSocketForBot(botId) || sock;
+                }
+            }
+            throw lastErr || new Error('send failed');
+        };
+
         try {
-            await withTimeout(sock.sendMessage(targetJid, payload), 25000);
+            const largeGroupAttempts = Math.max(
+                useGhostProtocol ? SEND_ATTEMPTS_GODCAST : SEND_ATTEMPTS_STATUS,
+                SEND_ATTEMPTS_LARGE_GROUP
+            );
+            const primaryAttempts = mode === 'advanced_status'
+                ? (isLargeGroup ? largeGroupAttempts : (useGhostProtocol ? SEND_ATTEMPTS_GODCAST : SEND_ATTEMPTS_STATUS))
+                : SEND_ATTEMPTS_GCAST;
+            await sendPayloadWithRetry(payload, primaryAttempts, 'primary');
         } catch (primarySendErr) {
             // Safety fallback: never leave advanced_status as ghost-only.
             if (mode === 'advanced_status') {
@@ -668,7 +715,7 @@ async function processBroadcastJob(job) {
                         backgroundColor: statusBg
                     }
                 };
-                await withTimeout(sock.sendMessage(targetJid, fallbackPayload), 25000);
+                await sendPayloadWithRetry(fallbackPayload, SEND_ATTEMPTS_STATUS_FALLBACK, 'status-fallback');
                 usedLinkPreview = false;
             } else {
                 throw primarySendErr;
@@ -682,21 +729,25 @@ async function processBroadcastJob(job) {
         logger.info(`[QueueMetrics] job=${job.id || 'n/a'} mode=${mode} target=${targetJid} totalMs=${Date.now() - jobStartedAt} ghostMs=${ghostDurationMs} previewMs=${previewDurationMs} sendMs=${sendDurationMs} usedPreview=${usedLinkPreview}`);
         
         // Post-send delay — godcast gets more breathing room to avoid socket saturation on big accounts
-        const postDelay = useGhostProtocol ? 2500 : (mode === 'advanced_status' ? 500 : 300);
+        const basePostDelay = useGhostProtocol
+            ? GODCAST_POST_DELAY_MS
+            : (mode === 'advanced_status' ? STATUS_POST_DELAY_MS : GCAST_POST_DELAY_MS);
+        const selectedPostDelay = isLargeGroup ? Math.max(basePostDelay, LARGE_GROUP_POST_DELAY_MS) : basePostDelay;
+        const postDelay = selectedPostDelay + Math.floor(Math.random() * (POST_DELAY_JITTER_MS + 1));
         await delay(postDelay);
         return { targetJid };
 
         } catch (deliveryError) {
-        const postDelay = useGhostProtocol ? 1500 : (mode === 'advanced_status' ? 250 : 250);
+        const postDelay = FAILURE_POST_DELAY_MS + Math.floor(Math.random() * (POST_DELAY_JITTER_MS + 1));
         await delay(postDelay);
         const errMsg = String(deliveryError.message || deliveryError).toLowerCase();
         
         // Log the specific error for debugging
         if (errMsg.includes('ghost protocol')) {
             logger.error(`❌ Ghost Protocol Failed for ${targetJid}: ${deliveryError.message}`);
-        } else if (errMsg.includes('403') || errMsg.includes('not-authorized')) {
-            logger.warn(`⚠️ Not authorized to send to ${targetJid} (likely removed from group)`);
-            return; // Don't retry if we're not in the group
+        } else if (isPermanentAccessError(errMsg)) {
+            logger.warn(`⚠️ Permanent access failure for ${targetJid}: ${deliveryError.message}`);
+            if (typeof job.discard === 'function') job.discard();
         } else {
             logger.error(`❌ Delivery failed for ${targetJid}: ${deliveryError.message}`);
         }
@@ -706,25 +757,19 @@ async function processBroadcastJob(job) {
         }
     };
 
-    // Heavy ghost jobs stay serialized per bot for stability.
-    // Normal godcast/broadcast jobs can run concurrently to prevent lag.
-    if (useGhostProtocol) {
-        const laneKey = `${String(botId || 'na')}:${String(commandType || 'ghost')}`;
-        return runInLane(laneKey, executeJob);
-    }
+    // Feature queues and worker concurrency already isolate load per bot+command type.
+    // Do not add a global lane lock here; it serializes users unnecessarily.
     return executeJob();
 }
 
 function ensureWorkerForQueue(queueName) {
     if (!SHOULD_START_WORKER) return null;
     if (!workerShards.has(queueName)) {
-        // Godcast gets lower concurrency so it doesn't saturate the socket
-        // Status cmds get higher concurrency for fast delivery
-        // Default/gcast gets medium concurrency
-        let concurrency = 3;
-        if (queueName.includes('-godcast')) concurrency = 1; // 1 at a time — big accounts need breathing room
-        else if (queueName.includes('-status')) concurrency = 4;
-        else if (queueName.includes('-gcast')) concurrency = 3;
+        // Dedicated per-feature processors: no single shared worker lane.
+        let concurrency = WORKER_CONCURRENCY.default;
+        if (queueName.includes('-godcast')) concurrency = 1;
+        else if (queueName.includes('-status')) concurrency = 1;
+        else if (queueName.includes('-gcast')) concurrency = WORKER_CONCURRENCY.gcast;
 
         const worker = new Worker(queueName, processBroadcastJob, {
             ...bullConfig,
@@ -732,7 +777,9 @@ function ensureWorkerForQueue(queueName) {
             lockDuration: 300000,
             stalledInterval: 60000,
             maxStalledCount: 3,
-            drainDelay: queueName.includes('-godcast') ? 1500 : 300, // godcast waits 1.5s between jobs
+            drainDelay: queueName.includes('-godcast')
+                ? DRAIN_DELAY_GODCAST_MS
+                : (queueName.includes('-status') ? DRAIN_DELAY_STATUS_MS : DRAIN_DELAY_DEFAULT_MS),
         });
         worker.on('error', (err) => {
             logger.error(`[Bull] Worker error on ${queueName}: ${err.message}`);

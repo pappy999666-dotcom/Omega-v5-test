@@ -231,6 +231,10 @@ Special actions (reply with EXACTLY these prefixes when triggered):
 - Music/play requested → PLAY:<song title>
 - Video requested → SEARCH_VIDEO:<query>
 - Sticker requested or vibe reaction fits → SEND_STICKER:<sticker description>
+- Open game quick panel → GAME_MENU
+- Build temporary inline buttons → INLINE_TEMP:<title>|<label1>=><action1>|<label2>=><action2>
+    Allowed game actions: tg_game_open, tg_game_spin, tg_game_daily, tg_game_balance, tg_game_profile, tg_game_inventory, tg_game_lb
+    Allowed advanced action: RUN_DOT:.<command>
 - Terminal command requested (ADMIN/OWNER only) → EXECUTE_COMMAND:<bash command>
 
 If context includes AI vibe, adapt tone to that vibe in normal text replies.
@@ -407,6 +411,13 @@ function interceptIntent(prompt, platform, role) {
         if (!query) return 'PLAY_SEARCH:';
         return `PLAY:${query}`;
     }
+    if (/^(send|play|queue)\s+(.+?)\s+(and|&|,|\+)\s+(.+)/i.test(p) || /multiple\s+(songs?|tracks?|music)/i.test(p)) {
+        // User wants multiple songs: "send me song1 and song2"
+        const parts = prompt.split(/\s+(and|&|,|\+)\s+/).filter((x, i) => i % 2 === 0);
+        const songs = parts.map(x => x.replace(/^(send|play|queue|me|a|the)\s+/i, '').trim()).filter(Boolean);
+        if (songs.length >= 2) return `PLAY_MULTI:${songs.join('|')}`;
+        return `PLAY:${songs[0] || 'song'}`;
+    }
     if (/^(send|make|create|generate)\s+(me\s+)?(a\s+)?(voice|vn|voice note)/i.test(p)) {
         const text = prompt.replace(/^(send|make|create|generate)\s+(me\s+)?(a\s+)?(voice|vn|voice note)\s*/i, '').trim();
         return `SPEAK:${text || 'hey what is good'}`;
@@ -419,6 +430,23 @@ function interceptIntent(prompt, platform, role) {
         const desc = prompt.replace(/^(generate|create|make|draw)\s+(me\s+)?(a\s+|an\s+)?image\s*/i, '').trim();
         return `GENERATE_IMAGE:${desc || 'cool aesthetic art'}`;
     }
+    if (/^(create|make|start|create)\s+(a\s+)?(poll|vote|survey|question)/i.test(p)) {
+        const content = prompt.replace(/^(create|make|start)\s+(a\s+)?(poll|vote|survey|question)\s*/i, '').trim();
+        if (!content) return 'CREATE_POLL:What do you think?|Option 1|Option 2|Option 3';
+        const lines = content.split(/\n|[|]/).map(l => l.trim()).filter(Boolean);
+        const q = lines[0] || 'What do you think?';
+        const opts = lines.slice(1, 4);
+        if (opts.length < 2) opts.push('Option 2');
+        if (opts.length < 2) opts.push('Option 3');
+        return `CREATE_POLL:${q}|${opts.join('|')}`;
+    }
+    if (/^mood\s+(sticker|emoji|react)/i.test(p) || /send\s+(a\s+)?(mood|emotion|feeling)/i.test(p)) {
+        const mood = prompt.replace(/^(mood|send.*mood)\s*/i, '').trim() || 'happy';
+        return `MOOD_STICKER:${mood}`;
+    }
+    if (/^(save|store|pack|add)\s+(sticker|this)/i.test(p) || /sticker.*pack|pack.*sticker/i.test(p)) {
+        return 'SAVE_STICKER_PACK';
+    }
     if (/^(send|make|create)\s+(me\s+)?(a\s+)?sticker/i.test(p)) {
         const desc = prompt.replace(/^(send|make|create)\s+(me\s+)?(a\s+)?sticker\s*/i, '').trim();
         return `SEND_STICKER:${desc || 'cool anime reaction sticker'}`;
@@ -430,7 +458,7 @@ function interceptIntent(prompt, platform, role) {
 function cleanAiReply(reply) {
     if (!reply) return reply;
     const trimmed = String(reply).trim();
-    const PREFIXES = ['SPEAK:', 'GENERATE_IMAGE:', 'PLAY:', 'SEARCH_VIDEO:', 'SEND_STICKER:', 'EXECUTE_COMMAND:'];
+    const PREFIXES = ['SPEAK:', 'GENERATE_IMAGE:', 'PLAY:', 'PLAY_MULTI:', 'PLAY_SEARCH:', 'SEARCH_VIDEO:', 'SEND_STICKER:', 'MOOD_STICKER:', 'CREATE_POLL:', 'SAVE_STICKER_PACK', 'DELETE_MESSAGE:', 'WARN_USER:', 'KICK_USER:', 'BAN_USER:', 'MUTE_USER:', 'UNMUTE_USER:', 'LOCK_CHAT:', 'UNLOCK_CHAT:', 'EXECUTE_COMMAND:', 'RUN_DOT:'];
     for (const prefix of PREFIXES) {
         const idx = trimmed.indexOf(prefix);
         if (idx !== -1 && idx < 150) {
@@ -439,6 +467,9 @@ function cleanAiReply(reply) {
         }
     }
     return trimmed;
+
+    // Also check for SAVE_STICKER_PACK without colon
+    if (trimmed === 'SAVE_STICKER_PACK' || trimmed.startsWith('SAVE_STICKER_PACK:')) return 'SAVE_STICKER_PACK';
 }
 
 async function generateText(prompt, userId = 'global', { platform = 'whatsapp', role = 'USER', extra = '', provider = DEFAULT_PROVIDER, model = '', apiKey = '' } = {}) {
@@ -481,11 +512,31 @@ async function generateText(prompt, userId = 'global', { platform = 'whatsapp', 
     try {
         let reply = '';
         
-        const doKey = process.env.DIGITALOCEAN_AI_KEY;
+        const azureKey      = process.env.AZURE_OPENAI_KEY;
+        const azureEndpoint = process.env.AZURE_OPENAI_ENDPOINT;
+        const azureModel    = process.env.AZURE_OPENAI_CHAT_MODEL || 'DeepSeek-V3-0324';
+        const doKey  = process.env.DIGITALOCEAN_AI_KEY;
         const oaiKey = process.env.OPENAI_API_KEY && !process.env.OPENAI_API_KEY.includes('your_') ? process.env.OPENAI_API_KEY : null;
         const orKey  = process.env.OPENROUTER_API_KEY && !process.env.OPENROUTER_API_KEY.includes('your_') ? process.env.OPENROUTER_API_KEY : null;
 
-        // ── PRIMARY: GPT-4o-mini (if real key) — fastest + smartest ──────────
+        // ── PRIMARY: Azure OpenAI — fastest, always try first ──────────────────────
+        if (azureKey && azureEndpoint) {
+            try {
+                logger.info(`[AI] Trying Azure ${azureModel}`);
+                // Azure endpoint is the full URL already, post directly
+                const azureRes = await axios.post(azureEndpoint, {
+                    model: azureModel,
+                    messages,
+                    max_tokens: 400,
+                    temperature: 0.7,
+                }, {
+                    headers: { 'Authorization': `Bearer ${azureKey}`, 'Content-Type': 'application/json' },
+                    timeout: 15000,
+                });
+                reply = azureRes.data?.choices?.[0]?.message?.content?.trim() || '';
+                if (reply) { logger.success(`[AI] Azure ${azureModel} ✓`); const clean = cleanAiReply(reply); await updateMemory(userId, prompt, clean); return clean; }
+            } catch (e) { logger.warn(`[AI] Azure ${azureModel}: ${e.message}`); }
+        }
         if (oaiKey) {
             try {
                 logger.info('[AI] Trying GPT-4o-mini');
@@ -693,8 +744,8 @@ async function searchVideo(query) {
     try {
         const results = await searchYoutube(safeQuery, 1);
         if (!results.length) throw new Error('No results');
-        const { buffer, title } = await downloadVideo(results[0].videoId);
-        return { buffer, title: title || safeQuery };
+          const { buffer, title, mimetype, fileExt } = await downloadVideo(results[0].videoId);
+          return { buffer, title: title || safeQuery, mimetype: mimetype || 'video/mp4', fileExt: fileExt || 'mp4' };
     } catch (err) {
         // Fallback to yt-dlp
         const { exec } = require('child_process');
@@ -705,12 +756,12 @@ async function searchVideo(query) {
         const ytDlpBin = String(process.env.YTDLP_BIN || '').trim()
             || (fs.existsSync('/usr/local/bin/yt-dlp') ? '/usr/local/bin/yt-dlp' : 'yt-dlp');
         const cookieArg = fs.existsSync(cookiesPath) ? `--cookies "${cookiesPath}"` : '';
-        const cmd = `${ytDlpBin} ${cookieArg} --js-runtimes "node:/usr/bin/node" -f "bestvideo[ext=mp4][filesize<15M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<15M]/18" --merge-output-format mp4 --max-filesize 15m -o "${outPath}" "ytsearch1:${safeQuery}" --no-playlist --quiet`;
+          const cmd = `${ytDlpBin} ${cookieArg} --js-runtimes "node:/usr/bin/node" -f "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/22/18" --merge-output-format mp4 --max-filesize 40m -o "${outPath}" "ytsearch1:${safeQuery}" --no-playlist --quiet`;
         await execAsync(cmd, { timeout: 90000 });
         if (!fs.existsSync(outPath)) throw new Error('Video download failed');
         const buffer = await fs.promises.readFile(outPath);
         fs.unlink(outPath, () => {});
-        return { buffer, title: safeQuery };
+          return { buffer, title: safeQuery, mimetype: 'video/mp4', fileExt: 'mp4' };
     }
 }
 

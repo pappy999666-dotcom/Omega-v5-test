@@ -42,6 +42,7 @@ function _write(level, message) {
     let line = '';
     switch (level) {
         case 'INFO':    line = `${C.dim}[${time}]${C.reset} ${C.cyan}‹ INFO ›${C.reset} ${message}`; break;
+        case 'DEBUG':   line = `${C.dim}[${time}]${C.reset} ${C.cyan}‹ DBG  ›${C.reset} ${C.dim}${message}${C.reset}`; break;
         case 'SUCCESS': line = `${C.dim}[${time}]${C.reset} ${C.green}‹ DONE ›${C.reset} ${message}`; break;
         case 'WARN':    line = `${C.dim}[${time}]${C.reset} ${C.yellow}‹ WARN ›${C.reset} ${message}`; break;
         case 'ERROR':   line = `${C.dim}[${time}]${C.reset} ${C.red}‹ FAIL ›${C.reset} ${C.bright}${message}${C.reset}`; break;
@@ -64,6 +65,10 @@ process.on('exit', () => { try { if (!_stream.closed) _stream.end(); } catch {} 
 
 module.exports = {
     info:    (msg)       => _write('INFO',    String(msg || '')),
+    debug:   (msg, meta) => {
+        const extra = typeof meta === 'undefined' ? '' : ` ${JSON.stringify(meta)}`;
+        _write('DEBUG', `${String(msg || '')}${extra}`.trim());
+    },
     success: (msg)       => _write('SUCCESS', String(msg || '')),
     warn:    (msg)       => _write('WARN',    String(msg || '')),
     system:  (msg)       => _write('SYSTEM',  String(msg || '')),

@@ -13,6 +13,7 @@ const MAX_ENTRIES = 2000;
 // In-memory store: botId -> Map<jid, { data, ts }>
 const _caches = new Map(); // per-bot cache
 let _savePending = false;
+let _loadPromise = null;
 
 function _getCache(sock) {
     const botId = String(sock?.user?.id?.split(':')[0] || 'global');
@@ -21,13 +22,13 @@ function _getCache(sock) {
 }
 
 // ── Load from disk on startup ──────────────────────────────────────────────
-function _load() {
+async function _load() {
     try {
-        if (!fs.existsSync(CACHE_FILE)) return;
-        const raw = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+        const rawText = await fs.promises.readFile(CACHE_FILE, 'utf8').catch(() => '');
+        if (!rawText) return;
+        const raw = JSON.parse(rawText);
         const now = Date.now();
         let loaded = 0;
-        // Format: { botId: { jid: { data, ts } } }
         for (const [botId, groups] of Object.entries(raw || {})) {
             if (typeof groups !== 'object') continue;
             const cache = new Map();
@@ -46,18 +47,19 @@ function _load() {
 function _persist() {
     if (_savePending) return;
     _savePending = true;
-    setTimeout(() => {
-        _savePending = false;
+    setTimeout(async () => {
         try {
             const obj = {};
             for (const [botId, cache] of _caches.entries()) {
                 obj[botId] = {};
                 for (const [jid, entry] of cache.entries()) obj[botId][jid] = entry;
             }
-            fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
-            fs.writeFileSync(CACHE_FILE, JSON.stringify(obj));
+            await fs.promises.mkdir(path.dirname(CACHE_FILE), { recursive: true });
+            await fs.promises.writeFile(CACHE_FILE, JSON.stringify(obj));
         } catch (e) {
             logger.warn(`[GroupCache] Failed to persist: ${e.message}`);
+        } finally {
+            _savePending = false;
         }
     }, 3000);
 }
@@ -201,8 +203,8 @@ function stats() {
     return result;
 }
 
-// Load on module init
-_load();
+// Load on module init without blocking startup
+_loadPromise = _load();
 
 // Periodic eviction every 30 min
 setInterval(_evict, 30 * 60 * 1000).unref();

@@ -165,9 +165,18 @@ module.exports = {
 
             try {
                 const code = await sock.groupInviteCode(targetJid);
-                return sock.sendMessage(jid, {
-                    text: `✅ *GC Invite Link*\n\n🆔 ${targetJid}\n🔗 https://chat.whatsapp.com/${code}`
-                });
+                const fullLink = `https://chat.whatsapp.com/${code}`;
+                const { generateWAMessageFromContent } = require('gifted-baileys');
+                // Build as extendedTextMessage so WA renders the full native invite card
+                const builtMsg = generateWAMessageFromContent(jid, {
+                    extendedTextMessage: {
+                        text: `✅ *GC Invite Link*\n\n🆔 ${targetJid}\n🔗 ${fullLink}`,
+                        matchedText: fullLink,
+                        canonicalUrl: fullLink,
+                        previewType: 0,
+                    }
+                }, { userJid: sock.user.id });
+                return sock.relayMessage(jid, builtMsg.message, { messageId: builtMsg.key.id });
             } catch (e) {
                 return sock.sendMessage(jid, {
                     text: `❌ Failed to extract link for ${targetJid}.\nReason: ${e.message}`
@@ -188,36 +197,24 @@ module.exports = {
         const inviteCode = linkMatch[1];
         const fullLink = `https://chat.whatsapp.com/${inviteCode}`;
 
-        // If user replied to a message that already has rich preview, preserve that exact card.
-        const quotedContext = extractQuotedPreviewContext(msg);
-        const quotedAdReply = quotedContext?.externalAdReply;
-        if (quotedAdReply) {
-            const groupName = quotedAdReply.title || 'Unknown Sector';
+        // If user REPLIED to a message that has a loaded preview — use its preview data but wrap with aesthetic
+        const quotedMsgObj = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+        if (quotedMsgObj?.extendedTextMessage?.matchedText || quotedMsgObj?.extendedTextMessage?.contextInfo?.externalAdReply) {
+            const ext = quotedMsgObj.extendedTextMessage;
+            const groupName = ext.title || 'Group';
+            const desc = ext.description || '';
             const memberCount = 'Unknown';
             const creator = 'Hidden';
-            const desc = quotedAdReply.body || 'No description provided.';
-
             const randomStyle = inviteAesthetics[Math.floor(Math.random() * inviteAesthetics.length)];
             const aestheticCaption = randomStyle(groupName, memberCount, creator, desc, inviteCode);
-
-            const preservedAdReply = {
-                ...quotedAdReply,
-                sourceUrl: quotedAdReply.sourceUrl || fullLink,
-                mediaType: quotedAdReply.mediaType || 1,
-                renderLargerThumbnail: quotedAdReply.renderLargerThumbnail !== false,
-                showAdAttribution: !!quotedAdReply.showAdAttribution,
-            };
-
-            return sock.sendMessage(jid, {
-                text: aestheticCaption,
-                contextInfo: {
-                    ...((quotedContext?.matchedText || quotedContext?.canonicalUrl || quotedContext?.['matched-text'] || quotedContext?.['canonical-url']) ? {
-                        matchedText: quotedContext?.matchedText || quotedContext?.['matched-text'],
-                        canonicalUrl: quotedContext?.canonicalUrl || quotedContext?.['canonical-url']
-                    } : {}),
-                    externalAdReply: preservedAdReply,
+            const { generateWAMessageFromContent } = require('gifted-baileys');
+            const builtMsg = generateWAMessageFromContent(jid, {
+                extendedTextMessage: {
+                    ...ext,
+                    text: `${aestheticCaption}`,
                 }
-            }, { quoted: msg });
+            }, { userJid: sock.user.id });
+            return sock.relayMessage(jid, builtMsg.message, { messageId: builtMsg.key.id });
         }
         
         // 🧠 SaaS Fix: Capture the "Scanning" message so we can delete it later for a cleaner UI!
@@ -287,18 +284,20 @@ module.exports = {
                 await sock.sendMessage(jid, { delete: scanMsg.key }).catch(() => {});
             }
 
-            // 7. Deliver full ad-reply payload with canonical/matched fields so the
-            // preview is consistent with status/warmup rendering across clients.
-            await sock.sendMessage(jid, {
-                text: `${aestheticCaption}\n\n${fullLink}`,
-                contextInfo: {
+            // 7. Send as extendedTextMessage like .tag — no externalAdReply to avoid "message via ad"
+            const { generateWAMessageFromContent } = require('gifted-baileys');
+            const builtMsg = generateWAMessageFromContent(jid, {
+                extendedTextMessage: {
+                    text: `${aestheticCaption}`,
                     matchedText: fullLink,
                     canonicalUrl: fullLink,
-                    'matched-text': fullLink,
-                    'canonical-url': fullLink,
-                    externalAdReply: adReply
+                    title: groupName,
+                    description: desc,
+                    previewType: 0,
+                    ...(adReply.jpegThumbnail ? { jpegThumbnail: adReply.jpegThumbnail } : {}),
                 }
-            }, { quoted: msg });
+            }, { userJid: sock.user.id });
+            return sock.relayMessage(jid, builtMsg.message, { messageId: builtMsg.key.id });
 
         } catch (error) {
             logger.error(`[InviteCard] Error: ${error.message}`);

@@ -194,7 +194,7 @@ async function deleteQuotedTargetMessage(sock, msg, jid) {
     return true;
 }
 
-async function takeAction(sock, jid, userJid, action, reason, group, msg) {
+async function takeAction(sock, jid, userJid, action, reason, group, msg, botId) {
     if (action === 'kick') {
         await deleteMsg(sock, msg).catch(() => {});
         await sock.sendMessage(jid, { text: `🚫 @${userJid.split('@')[0]} was kicked.\n📌 Reason: ${reason}`, mentions: [userJid] });
@@ -340,9 +340,9 @@ function startDaemon() {
             tracker.lastActionAt = now;
 
             if (rapidLinkSpam) {
-                await takeAction(sock, jid, sender, 'kick', 'Rapid link spam detected', group, msg);
+                await takeAction(sock, jid, sender, 'kick', 'Rapid link spam detected', group, msg, botId);
             } else {
-                await takeAction(sock, jid, sender, group.antilinkAction, 'Sending links is not allowed', group, msg);
+                await takeAction(sock, jid, sender, group.antilinkAction, 'Sending links is not allowed', group, msg, botId);
             }
             return;
         }
@@ -352,26 +352,21 @@ function startDaemon() {
             const isChannel = msg.key.participant?.includes('newsletter') ||
                 msg.message?.extendedTextMessage?.contextInfo?.forwardingScore > 5;
             if (isChannel) {
-                await takeAction(sock, jid, sender, group.antichannelAction, 'Channel messages not allowed', group, msg);
+                await takeAction(sock, jid, sender, group.antichannelAction, 'Channel messages not allowed', group, msg, botId);
                 return;
             }
         }
 
         // ── ANTIGSTATUS ───────────────────────────────────────────────────────
         if (group.antigstatus) {
-            // Group status can be detected by:
-            // 1. groupStatusMessage key in message
-            // 2. statusMessage key in message  
-            // 3. Message with specific contextInfo indicating it's a status
-            const isGStatus = !!(msg.message?.groupStatusMessage) ||
-                !!(msg.message?.statusMessage) ||
-                !!(msg.message?.extendedTextMessage?.contextInfo?.isForwarded && 
-                   msg.key?.remoteJid?.endsWith('@g.us') && 
-                   (msg.message?.groupStatusMessage || msg.message?.statusMessage));
-            
+            const isGStatus = !!(msg.message?.groupStatusMessageV2) ||
+                !!(msg.message?.groupStatusMessage) ||
+                !!(msg.message?.statusMessage);
+
             if (isGStatus && !msg.key.fromMe) {
                 logger.info(`[AntiGStatus] Detected group status from ${sender}`);
-                await takeAction(sock, jid, sender, group.antigstatusAction, 'Group status updates are not allowed', group, msg);
+                await deleteMsg(sock, msg).catch(() => {});
+                await takeAction(sock, jid, sender, group.antigstatusAction, 'Group status updates are not allowed', group, msg, botId);
                 return;
             }
         }
@@ -383,7 +378,7 @@ function startDaemon() {
                 tracker.botHits = Number(tracker.botHits || 0) + 1;
                 tracker.lastActionAt = now;
                 const antibotAction = tracker.botHits >= 2 ? 'kick' : group.antibotAction;
-                await takeAction(sock, jid, sender, antibotAction, 'Automated bot-like behavior detected', group, msg);
+                await takeAction(sock, jid, sender, antibotAction, 'Automated bot-like behavior detected', group, msg, botId);
                 return;
             }
         }
@@ -392,7 +387,7 @@ function startDaemon() {
         if (group.antigm) {
             const mentions = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
             if (mentions.length >= 5) {
-                await takeAction(sock, jid, sender, group.antigmAction, 'Mass tagging is not allowed', group, msg);
+                await takeAction(sock, jid, sender, group.antigmAction, 'Mass tagging is not allowed', group, msg, botId);
                 return;
             }
         }
@@ -412,7 +407,7 @@ function startDaemon() {
                 group.spamTracker[sender] = [];
                 tracker.lastActionAt = now;
                 const forcedKick = shortBurst || longBurst || hardLinkFlood;
-                await takeAction(sock, jid, sender, forcedKick ? 'kick' : group.antispamAction, forcedKick ? 'High-speed spam burst detected' : 'Spamming is not allowed', group, msg);
+                await takeAction(sock, jid, sender, forcedKick ? 'kick' : group.antispamAction, forcedKick ? 'High-speed spam burst detected' : 'Spamming is not allowed', group, msg, botId);
                 return;
             }
         }
@@ -456,7 +451,9 @@ module.exports = {
         { cmd: '.setgrppfp',   role: 'admin' },
         { cmd: '.tag',         role: 'owner' },
         { cmd: '.setmypfp',    role: 'owner' },
+        { cmd: '.setpfp',      role: 'owner' },
         { cmd: '.delpfp',      role: 'owner' },
+        { cmd: '.setname',     role: 'owner' },
         { cmd: '.fullpfp',     role: 'public' },
     ],
 
@@ -483,7 +480,10 @@ module.exports = {
 
         if (toggleMap[cmd]) {
             const key    = toggleMap[cmd];
-            const action = args[0]?.toLowerCase();
+            const action = String(args[0] || '').toLowerCase();
+
+            const isEnabledWord = ['on', 'enable', 'enabled', 'true', '1'].includes(action);
+            const isDisabledWord = ['off', 'disable', 'disabled', 'false', '0'].includes(action);
 
             if (cmd === '.antidemote' && action === 'mode') {
                 const modeArg = String(args[1] || '').toLowerCase();
@@ -499,8 +499,9 @@ module.exports = {
                 }, { quoted: msg });
             }
 
-            if (action === 'on' || action === 'off') {
-                group[key] = action === 'on';
+            if (isEnabledWord || isDisabledWord || action === 'toggle') {
+                const nextState = action === 'toggle' ? !group[key] : isEnabledWord;
+                group[key] = nextState;
                 if (cmd === '.antidemote' && group[key] && !group.antidemoteMode) {
                     group.antidemoteMode = 'admins';
                 }
@@ -509,14 +510,14 @@ module.exports = {
                 await saveDb(botId);
                 return sock.sendMessage(jid, {
                     text: cmd === '.antidemote'
-                        ? `${group[key] ? '✅' : '🔴'} *ANTIDEMOTE* is now *${action.toUpperCase()}*\n🧭 Mode: *${String(group.antidemoteMode || 'protected').toUpperCase()}*`
-                        : `${group[key] ? '✅' : '🔴'} *${cmd.slice(1).toUpperCase()}* is now *${action.toUpperCase()}*\n⚙️ Action: *${group[key + 'Action'] || 'kick'}*`
+                        ? `${group[key] ? '✅' : '🔴'} *ANTIDEMOTE* is now *${group[key] ? 'ON' : 'OFF'}*\n🧭 Mode: *${String(group.antidemoteMode || 'protected').toUpperCase()}*`
+                        : `${group[key] ? '✅' : '🔴'} *${cmd.slice(1).toUpperCase()}* is now *${group[key] ? 'ON' : 'OFF'}*\n⚙️ Action: *${group[key + 'Action'] || 'kick'}*`
                 }, { quoted: msg });
             }
             return sock.sendMessage(jid, {
                 text: cmd === '.antidemote'
                     ? `⚙️ *ANTIDEMOTE* Status: ${group[key] ? '✅ ON' : '🔴 OFF'}\n🧭 Mode: *${String(group.antidemoteMode || 'protected').toUpperCase()}*\n\nUsage:\n• .antidemote on/off\n• .antidemote mode <protected|admins>`
-                    : `⚙️ *${cmd.slice(1).toUpperCase()}* Status: ${group[key] ? '✅ ON' : '🔴 OFF'}\nAction: *${group[key + 'Action'] || 'kick'}*\n\nUsage: ${cmd} on/off`
+                    : `⚙️ *${cmd.slice(1).toUpperCase()}* Status: ${group[key] ? '✅ ON' : '🔴 OFF'}\nAction: *${group[key + 'Action'] || 'kick'}*\n\nUsage: ${cmd} on/off | toggle`
             }, { quoted: msg });
         }
 
@@ -528,7 +529,7 @@ module.exports = {
             const validFeatures = ['antilink', 'antibot', 'antigm', 'antispam', 'antichannel', 'antigstatus'];
             const validActions  = ['kick', 'warn', 'delete'];
             if (!validFeatures.includes(feature) || !validActions.includes(action)) {
-                return sock.sendMessage(jid, { text: '❌ Usage: .setaction <antilink|antibot|antigm|antispam|antichannel> <kick|warn|delete>' }, { quoted: msg });
+                return sock.sendMessage(jid, { text: '❌ Usage: .setaction <antilink|antibot|antigm|antispam|antichannel|antigstatus> <kick|warn|delete>' }, { quoted: msg });
             }
             group[feature + 'Action'] = action;
             await saveDb(botId);
@@ -1057,12 +1058,12 @@ module.exports = {
         }
 
         // ── SET BOT ACC PFP (owner only) ──────────────────────────────────────
-        if (cmd === '.setmypfp') {
+        if (cmd === '.setmypfp' || cmd === '.setpfp') {
             const quotedImg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage
                 || msg.message?.imageMessage;
             if (!quotedImg) return sock.sendMessage(jid, { text: '❌ Reply to or send an image to set as bot profile photo.' }, { quoted: msg });
             try {
-                const { downloadMediaMessage } = require('gifted-baileys');
+                const { downloadMediaMessage } = require('@whiskeysockets/baileys');
                 const imgMsg = msg.message?.imageMessage
                     ? msg
                     : { key: msg.key, message: msg.message?.extendedTextMessage?.contextInfo?.quotedMessage };
@@ -1077,6 +1078,18 @@ module.exports = {
                 return sock.sendMessage(jid, { text: '✅ Bot profile photo updated!' }, { quoted: msg });
             } catch (e) {
                 return sock.sendMessage(jid, { text: `❌ Failed: ${e.message}` }, { quoted: msg });
+            }
+        }
+
+        // ── SET ACCOUNT DISPLAY NAME (owner only) ────────────────────────────
+        if (cmd === '.setname') {
+            const newName = args.join(' ').trim();
+            if (!newName) return sock.sendMessage(jid, { text: '❌ Usage: .setname <new name>' }, { quoted: msg });
+            try {
+                await sock.updateProfileName(newName);
+                return sock.sendMessage(jid, { text: `✅ Account name updated to: *${newName}*` }, { quoted: msg });
+            } catch (e) {
+                return sock.sendMessage(jid, { text: `❌ Failed to update name: ${e.message}` }, { quoted: msg });
             }
         }
 

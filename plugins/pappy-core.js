@@ -138,6 +138,7 @@ module.exports = {
         { cmd: '.ping',    role: 'public' },
         { cmd: '.sys',     role: 'public' },
         { cmd: '.pappy',   role: 'owner'  },
+        { cmd: '.papoy',   role: 'owner'  },
 
         { cmd: '.tts',     role: 'public' },
         { cmd: '.video',   role: 'public' },
@@ -348,12 +349,13 @@ module.exports = {
             }
         }
 
-        if (cmd === '.pappy') {
+        if (cmd === '.pappy' || cmd === '.papoy') {
             const action = args[0]?.toLowerCase();
-            const { botState, setPappyMode } = require('../core/whatsapp');
+            const { setPappyMode, getNodeState } = require('../core/whatsapp');
+            const nodeState = getNodeState(botId);
 
             if (action === 'on') {
-                setPappyMode(jid, true);
+                setPappyMode(jid, true, botId);
 
                 try {
                     const meta = await require('../core/groupCache').getGroupMeta(sock, jid);
@@ -373,11 +375,11 @@ module.exports = {
             }
 
             if (action === 'off') {
-                setPappyMode(jid, false);
+                setPappyMode(jid, false, botId);
                 return sock.sendMessage(jid, { text: '❌ Pappy mode deactivated' });
             }
 
-            const isOn = botState.pappyMode?.[jid] === true;
+            const isOn = nodeState.pappyMode?.[jid] === true;
             return sock.sendMessage(jid, { text: `pappy mode: ${isOn ? 'on' : 'off'}` });
         }
 
@@ -400,16 +402,43 @@ module.exports = {
             if (!query) return sock.sendMessage(jid, { text: 'Usage: .video [search]\nExample: .video funny cats' }, { quoted: msg });
             const searching = await sock.sendMessage(jid, { text: `🔍 Searching: ${query}...` }, { quoted: msg });
             try {
-                const aiModule = require('../core/ai');
-                const { buffer, title } = await aiModule.searchVideo(query);
+                const { searchYoutube, downloadVideo } = require('../core/youtube');
+                const results = await searchYoutube(query, 3);
+                if (!results.length) throw new Error('No results');
+
+                let picked = results[0];
+                let downloaded = null;
+                let lastErr = null;
+                for (const candidate of results) {
+                    try {
+                        downloaded = await downloadVideo(candidate.videoId, 48 * 1024 * 1024);
+                        picked = candidate;
+                        break;
+                    } catch (err) {
+                        lastErr = err;
+                    }
+                }
+
+                if (!downloaded) {
+                    // Fallback to AI helper path if direct youtube path fails.
+                    const aiModule = require('../core/ai');
+                    const fallback = await aiModule.searchVideo(query);
+                    downloaded = {
+                        buffer: fallback.buffer,
+                        title: fallback.title || picked.title || query,
+                        mimetype: fallback.mimetype || 'video/mp4',
+                    };
+                }
+
                 await sock.sendMessage(jid, {
-                    video: buffer,
-                    caption: title,
-                    mimetype: 'video/mp4',
+                    video: downloaded.buffer,
+                    caption: downloaded.title || picked.title || query,
+                    mimetype: downloaded.mimetype || 'video/mp4',
                     gifPlayback: false,
                 }, { quoted: msg });
                 await sock.sendMessage(jid, { delete: searching.key }).catch(() => {});
-            } catch {
+            } catch (err) {
+                logger.warn('[Video] Failed', { error: err.message });
                 await sock.sendMessage(jid, { text: "Couldn't find that video, try .play for audio only." }, { quoted: msg });
                 await sock.sendMessage(jid, { delete: searching.key }).catch(() => {});
             }
