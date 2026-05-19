@@ -55,6 +55,9 @@ data/group_meta_cache.json
 data/gs-config.json
 data/warmup-config*.json
 data/intel_join_*.json
+data/telegram-intel-node-cycles.json
+data/link-validation-cache.json
+data/wa-banned-accounts.json
 data/sticker_packs.json
 data/menu-song-library.json
 

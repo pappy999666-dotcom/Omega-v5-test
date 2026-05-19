@@ -1,235 +1,247 @@
-# Omega V5 - Elite WhatsApp Bot
+# Omega V5 Professional Bot Platform
 
-Advanced multi-node WhatsApp automation bot with AI, broadcasting, Intel scraping, and comprehensive group management.
+Production-ready multi-node WhatsApp automation platform with Telegram control plane, queue-driven broadcasting, Intel link ingestion/validation, and role-based command security.
 
-## 🚀 Features
+## What This Project Provides
 
-### Core Features
-- **Multi-Node Support** - Run multiple WhatsApp sessions simultaneously
-- **AI Integration** - Multiple AI providers (DigitalOcean, OpenRouter, Qwen, OpenAI, Claude, DeepSeek)
-- **Telegram Control** - Full bot management via Telegram
-- **Intel System** - Automatic group link scraping and auto-join queue
-- **Broadcasting** - Mass message/status updates across all groups
-- **Group Management** - Anti-link, anti-bot, anti-spam, auto-promote, strikes
-- **Sticker Engine** - Convert images/videos to animated stickers
-- **Menu System** - Dynamic command menus with AI-generated images
+- Multi-node WhatsApp runtime (Baileys)
+- Telegram operations dashboard (Telegraf)
+- Queue engine for broadcast/status jobs (BullMQ + Redis)
+- Intel link ingestion and controlled join workflows
+- Owner/admin/public command model
+- AI integrations and media utility modules
+- PM2-compatible process deployment for VPS
 
-### Advanced Features
-- **Node Mode** - Public/private command access per node
-- **Ghost Protocol** - Stealth broadcasting to avoid detection
-- **Queue System** - BullMQ-powered job processing with Redis
-- **Rate Limiting** - Prevent spam and abuse
-- **Role-Based Access** - Owner/Admin/Public command permissions
-- **Memory System** - AI conversation memory per user
-- **Link Preview** - Rich link previews for broadcasts
-- **Voice Notes** - AI voice analysis and TTS generation
+## Architecture Overview
 
-## 📋 Requirements
+1. Runtime entrypoint: `index.js`
+2. WhatsApp core: `core/whatsapp.js`
+3. Telegram control plane: `core/telegram.js`
+4. Queue engine: `core/bullEngine.js`
+5. Command plugins: `plugins/*.js`
+6. Persistent runtime state: `data/` (not for git)
 
-- **Node.js** 18+ (tested on v22.22.2)
-- **MongoDB** 4.4+
-- **Redis** 6.0+
-- **PM2** (for process management)
-- **yt-dlp** (for video downloads)
-- **ffmpeg** (for media processing)
+## Prerequisites
 
-## 🛠️ Installation
+- Linux VPS (Ubuntu 22.04+ recommended)
+- Node.js 22 LTS (or minimum supported by current deps)
+- npm 10+
+- Redis 6+
+- MongoDB 6+
+- PM2
+- ffmpeg
+- yt-dlp
 
-### 1. Clone Repository
+## 1) Server Bootstrap
+
 ```bash
-git clone https://github.com/yourusername/omega-v5.git
-cd omega-v5
-```
-
-### 2. Install Dependencies
-```bash
-npm install
-```
-
-### 3. Setup MongoDB
-```bash
-# Install MongoDB
 sudo apt update
-sudo apt install -y mongodb
+sudo apt install -y curl git ca-certificates build-essential ffmpeg redis-server
+```
 
-# Start MongoDB
-sudo systemctl start mongodb
-sudo systemctl enable mongodb
+Install Node.js 22 (NodeSource):
 
-# Create database user
+```bash
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
+node -v
+npm -v
+```
+
+Install PM2 globally:
+
+```bash
+sudo npm install -g pm2
+pm2 -v
+```
+
+Install yt-dlp:
+
+```bash
+sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
+sudo chmod a+rx /usr/local/bin/yt-dlp
+yt-dlp --version
+```
+
+## 2) Redis Setup
+
+```bash
+sudo systemctl enable redis-server
+sudo systemctl start redis-server
+sudo systemctl status redis-server --no-pager
+```
+
+Optional password hardening:
+
+```bash
+sudo sed -i 's/^# \?requirepass .*/requirepass REPLACE_WITH_STRONG_PASSWORD/' /etc/redis/redis.conf
+sudo systemctl restart redis-server
+```
+
+## 3) MongoDB Setup
+
+Install MongoDB Community edition and ensure service is running:
+
+```bash
+sudo systemctl enable mongod
+sudo systemctl start mongod
+sudo systemctl status mongod --no-pager
+```
+
+Create application DB/user (example):
+
+```bash
 mongosh
 use admin
 db.createUser({
-  user: "pappybot",
-  pwd: "your_secure_password",
-  roles: [{ role: "readWrite", db: "PappyUltimate2" }]
+  user: "omega_bot",
+  pwd: "REPLACE_WITH_STRONG_PASSWORD",
+  roles: [{ role: "readWriteAnyDatabase", db: "admin" }]
 })
 exit
 ```
 
-### 4. Setup Redis
+## 4) Clone and Install
+
 ```bash
-# Install Redis
-sudo apt install -y redis-server
-
-# Configure Redis password
-sudo nano /etc/redis/redis.conf
-# Uncomment and set: requirepass your_redis_password
-
-# Restart Redis
-sudo systemctl restart redis
-sudo systemctl enable redis
+git clone https://github.com/pappy999666-dotcom/Omega-v5-test.git
+cd Omega-v5-test
+npm install
 ```
 
-### 5. Install System Dependencies
-```bash
-# Install ffmpeg
-sudo apt install -y ffmpeg
+## 5) Environment Configuration
 
-# Install yt-dlp
-sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
-sudo chmod a+rx /usr/local/bin/yt-dlp
-```
+Create `.env` from your template and set all required variables:
 
-### 6. Configure Environment
 ```bash
-# Copy example env file
 cp .env.example .env
-
-# Edit with your credentials
 nano .env
 ```
 
-**Required Configuration:**
-- `OWNER_WA_JID` - Your WhatsApp number (e.g., 2348012345678)
-- `TG_BOT_TOKEN` - Get from @BotFather on Telegram
-- `OWNER_TG_ID` - Your Telegram user ID (get from @userinfobot)
-- `MONGO_URI` - MongoDB connection string
-- `REDIS_PASSWORD` - Redis password
-- At least one AI API key (DigitalOcean recommended)
+At minimum, configure:
 
-### 7. Start Bot
+- WhatsApp owner identifiers
+- Telegram bot token and owner Telegram ID
+- MongoDB URI
+- Redis host/port/password
+- Any AI provider keys you actually use
+
+Important:
+
+- Never commit `.env`
+- Never commit `data/sessions/`
+- Never commit runtime JSON state files
+
+## 6) Preflight Validation
+
+Run syntax checks across JS sources before first start:
+
 ```bash
-# Using PM2 (recommended)
+find . -type f -name "*.js" -not -path "./node_modules/*" -print0 | xargs -0 -I{} node -c "{}"
+```
+
+If command returns no output and exit code 0, syntax is healthy.
+
+## 7) Start with PM2
+
+```bash
 pm2 start ecosystem.config.js
 pm2 save
-
-# Or using Node directly
-npm start
+pm2 status
 ```
 
-## 📱 Pairing WhatsApp
-
-### Via Telegram
-1. Start your Telegram bot: `/start`
-2. Go to **Nodes** → **Deploy Node**
-3. Enter phone number with country code (e.g., 2348012345678)
-4. Check WhatsApp for pairing code
-5. Enter code in WhatsApp → Linked Devices → Link with phone number
-
-## Telegram Hub Features
-
-### Auto-Downloader Toggle
-- Open Telegram hub and tap **Auto-Downloader ON/OFF**.
-- When ON, sending a supported link auto-downloads media with live progress updates.
-- Supported platforms include YouTube, TikTok, Instagram, X/Twitter, Facebook, Reddit, Spotify, SoundCloud, Pinterest, Dailymotion, Vimeo, and Twitch.
-
-### Music Finder Toggle
-- Open Telegram hub and tap **Music Finder ON/OFF**.
-- When ON:
-- Send a song name as text to get top YouTube matches (inline buttons).
-- Forward an audio file (with title/file metadata) to trigger song suggestions.
-- Tap a suggested result to receive MP3 audio and lyrics.
-
-### Extract Audio From Downloaded Video
-- After auto-downloading a video, the bot shows an **Extract Audio** button.
-- Tap it to fetch and send the MP3 version of that video.
-
-## 🎮 Commands
-
-### Public Commands
-- `.menu` - Show command menu
-- `.ping` - Check bot latency
-- `.sys` - System stats
-- `.play [song]` - Play music
-- `.video [search]` - Send video
-- `.tourl` - Convert media to URL
-- `.tts [text]` - Text to speech
-
-### Admin Commands (Group Admins)
-- `.promote` / `.demote` - Manage admins
-- `.kick` - Remove member
-- `.warn` / `.warns` / `.resetwarn` - Warning system
-- `.mute` / `.unmute` - Lock/unlock group
-- `.antilink on/off` - Auto-delete links
-- `.antibot on/off` - Auto-kick bots
-- `.antispam on/off` - Spam protection
-- `.updategstatus` - Update group status
-
-### Owner Commands
-- `.pappy on/off` - Toggle AI mode
-- `.nodemode public/private` - Set node access mode
-- `.gcast [message]` - Broadcast to all groups
-- `.godcast [message]` - Stealth broadcast
-- `.autojoin on/off` - Auto-join groups from links
-- `.sudo [number]` - Add sudo user
-- `.setprefix [symbol]` - Change command prefix
-
-## 🤖 AI Configuration
-
-The bot supports multiple AI providers. Configure at least one:
-
-### DigitalOcean AI (Recommended - Free Tier)
-```bash
-DIGITALOCEAN_AI_KEY=your_key_here
-```
-
-### Other Providers
-- **OpenRouter**: `OPENROUTER_API_KEY`
-- **Qwen (Alibaba)**: `QWEN_API_KEY`
-- **OpenAI**: `OPENAI_API_KEY`
-- **Claude**: `ANTHROPIC_API_KEY`
-- **DeepSeek**: `DEEPSEEK_API_KEY`
-
-## 🔒 Security
-
-### Protected Data (Gitignored)
-- `.env` - Environment variables
-- `data/sessions/` - WhatsApp session files
-- `data/botState*.json` - Bot state files
-- `data/intel.json` - Intel database
-- `data/logs/` - Log files
-
-## 📊 Monitoring
+Optional startup persistence:
 
 ```bash
-pm2 status              # Check bot status
-pm2 logs omega-v5       # View logs
-pm2 restart omega-v5    # Restart bot
-pm2 monit               # Monitor resources
+pm2 startup
+# run command printed by pm2 startup, then:
+pm2 save
 ```
 
-## 🐛 Troubleshooting
+## 8) Pairing and First Use
 
-### AI Not Working
-1. Check API keys in `.env`
-2. Verify DigitalOcean AI key is valid
-3. Check logs: `pm2 logs omega-v5 | grep AI`
+1. Open Telegram bot and run `/start`
+2. Use node deployment controls from Telegram panel
+3. Pair WhatsApp number via generated pairing flow
+4. Confirm node online status from Telegram hub
 
-### WhatsApp Disconnecting
-1. Clear bad sessions: `rm -rf data/sessions/*/session-*`
-2. Restart bot: `pm2 restart omega-v5`
-3. Re-pair if needed
+## 9) Operational Safety Recommendations
 
-## 📄 License
+- Keep Intel auto-join in queue mode by default
+- Avoid enabling aggressive realtime joins permanently
+- Keep broadcast concurrency conservative on new numbers
+- Monitor PM2 logs during campaigns
+- Use owner-only controls for queue wipes and node restarts
 
-MIT License
+## 10) Useful Runtime Commands
 
-## 📞 Support
+```bash
+pm2 status
+pm2 logs omega-v5-test --lines 200
+pm2 restart omega-v5-test
+pm2 describe omega-v5-test
+```
 
-- **Telegram**: t.me/pappylung
-- **Issues**: GitHub Issues
+Quick health checks:
 
----
+```bash
+node -c index.js
+node -c core/telegram.js
+node -c core/whatsapp.js
+```
 
-**Built with ❤️ by Pappy**
+## 11) Git Hygiene and Safe Push Workflow
+
+Check auth and repo state:
+
+```bash
+gh auth status
+git status
+git remote -v
+```
+
+Commit and push:
+
+```bash
+git add .
+git commit -m "chore: production hardening and documentation update"
+git push origin main
+```
+
+If your default branch is not `main`, push to the active branch shown by `git branch --show-current`.
+
+## 12) What Must Stay Ignored
+
+This repository intentionally excludes runtime-sensitive state, including:
+
+- `.env`
+- `data/sessions/`
+- local runtime caches and logs
+- per-node Intel cycle and join state
+- personally identifying Telegram/owner runtime state
+
+Review `.gitignore` before every push if you add new runtime files.
+
+## Troubleshooting
+
+Issue: bot starts but Telegram actions fail
+
+1. Verify `TG_BOT_TOKEN`
+2. Ensure no competing poller with same token is running
+3. Check `pm2 logs omega-v5-test --lines 200`
+
+Issue: Intel join appears slow to start
+
+1. Check validator status in Telegram join panel
+2. Inspect queue and cycle state under `data/`
+3. Confirm node is online and not in safety pause
+
+Issue: push to GitHub fails
+
+1. Run `gh auth status`
+2. Run `git remote -v`
+3. Resolve branch protections or permissions on GitHub
+
+## License
+
+Private/Project-specific unless explicitly relicensed by repository owner.

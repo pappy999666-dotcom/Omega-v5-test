@@ -194,7 +194,7 @@ You work in ITERATIONS — you keep going until the task is FULLY complete. Neve
 RESPONSE FORMAT — use these exact prefixes:
 - Plain text for explanations (brief)
 - RUN:<bash command>          — execute a shell command
-- WRITE_FILE:<path>           — write/create a file (follow with ``` content ```)
+- WRITE_FILE:<path>           — write/create a file (follow with \`\`\` content \`\`\`)
 - READ_FILE:<path>            — read a file
 - DELETE_FILE:<path>          — delete a file
 - MKDIR:<path>                — create directory
