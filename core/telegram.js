@@ -3661,9 +3661,13 @@ async function startTelegram() {
         const cycles = await readIntelNodeCycles();
         const cycle = cycles?.[sessionKey] || null;
         const activeCodes = Array.isArray(cycle?.activeCodes) ? cycle.activeCodes.length : 0;
+        const cursor = Number(cycle?.cursor || 0);
+        const windowStartCursor = Number(cycle?.windowStartCursor || 0);
         const startedAt = Number(cycle?.startedAt || 0);
+        const lastManualResetAt = Number(cycle?.lastManualResetAt || 0);
         const age = startedAt ? formatIntelCycleAge(Date.now() - startedAt) : 'not started';
         const running = !!global._intelJoinWorkers?.get(sessionKey)?.running;
+        const resetMark = lastManualResetAt ? ` at ${new Date(lastManualResetAt).toISOString().replace('T', ' ').slice(0, 16)} UTC` : '—';
 
         const text = [
             `🔗 <b>INTEL JOIN CONTROL</b>`,
@@ -3671,7 +3675,9 @@ async function startTelegram() {
             '',
             `🎯 Window cap: <b>${TG_INTEL_NODE_MAX_GROUPS}</b>`,
             `📦 Active cycle links: <b>${activeCodes}</b>`,
+            `🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${cursor}</b>`,
             `🕒 Cycle age: <b>${escapeHtml(String(age))}</b>`,
+            `♻️ Last manual reset: <b>${escapeHtml(resetMark)}</b>`,
             `🏃 Worker: <b>${running ? 'Running' : 'Idle'}</b>`,
             '',
             '<i>Use reset when this node reached cap and you want a fresh join window now.</i>',
@@ -3844,9 +3850,14 @@ async function startTelegram() {
         const filteredPrevWindow = prevWindow.filter((c) => codeSet.has(c));
         const now = Date.now();
         const cycleExpired = !prevStartedAt || ((now - prevStartedAt) >= TG_INTEL_NODE_CYCLE_MS) || filteredPrevWindow.length === 0;
+        const manualResetAt = Number(prev.lastManualResetAt || 0);
+        const previousRotationAt = Number(prev.lastRotationAt || 0);
 
         let codes = filteredPrevWindow;
         let rotateNow = false;
+        let windowStartCursor = Number(prev.windowStartCursor || 0);
+        let windowNextCursor = Number(prevCursor || 0);
+        let rotatedFromManualReset = false;
 
         if (cycleExpired) {
             rotateNow = true;
@@ -3856,9 +3867,13 @@ async function startTelegram() {
                 : 0;
             codes = buildIntelNodeJoinWindow(allCodes, sessionKey, startCursor, TG_INTEL_NODE_MAX_GROUPS, 5);
             const nextCursor = allCodes.length ? ((startCursor + codes.length) % allCodes.length) : 0;
+            windowStartCursor = startCursor;
+            windowNextCursor = nextCursor;
+            rotatedFromManualReset = manualResetAt > 0 && manualResetAt >= previousRotationAt;
             cycles[sessionKey] = {
                 startedAt: now,
                 cursor: nextCursor,
+                windowStartCursor: startCursor,
                 activeCodes: codes,
                 maxGroups: TG_INTEL_NODE_MAX_GROUPS,
                 cycleDays: 3,
@@ -3942,7 +3957,7 @@ async function startTelegram() {
 
         const statusMsg = showNodeMessage
             ? await ctx.editMessageText(
-                `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${TG_INTEL_NODE_MAX_GROUPS}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n\n♻️ Rotation: ${rotateNow ? 'YES (new 3-day cycle)' : 'NO (using active cycle)'}\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}\n🗃 Sources: shared=${sharedCount} • legacy=${legacyCount} • pending=${pendingCount}\n\n⏳ Scanning & joining slowly...`,
+                `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${TG_INTEL_NODE_MAX_GROUPS}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n\n♻️ Rotation: ${rotateNow ? 'YES (new 3-day cycle)' : 'NO (using active cycle)'}${rotatedFromManualReset ? ' • manual reset applied ✅' : ''}\n🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${windowNextCursor}</b>\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}\n🗃 Sources: shared=${sharedCount} • legacy=${legacyCount} • pending=${pendingCount}\n\n⏳ Scanning & joining slowly...`,
                 { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: backLabel, callback_data: backCallback }]] } }
             ).catch(() => null)
             : null;
@@ -3953,7 +3968,7 @@ async function startTelegram() {
             if (statusMsg) {
                 await global.tgBot.telegram.editMessageText(
                     ctx.chat.id, statusMsg.message_id, null,
-                    `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${TG_INTEL_NODE_MAX_GROUPS}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n\n♻️ Rotation: ${rotateNow ? 'YES (new 3-day cycle)' : 'NO (using active cycle)'}\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}\n🗃 Sources: shared=${sharedCount} • legacy=${legacyCount} • pending=${pendingCount}\n${validationLine}\n${dropLine}\n\n⏳ Scanning & joining slowly...`,
+                    `🔗 <b>INTEL GC JOIN STARTED</b>\n📱 Node: +${phone}\n📦 Total codes in pool: <b>${allCodes.length}</b>\n🎯 This cycle window: <b>${codes.length}/${TG_INTEL_NODE_MAX_GROUPS}</b>\n🏠 Already in: <b>${alreadyIn.size}</b> groups\n\n♻️ Rotation: ${rotateNow ? 'YES (new 3-day cycle)' : 'NO (using active cycle)'}${rotatedFromManualReset ? ' • manual reset applied ✅' : ''}\n🧭 Cursor: <b>${windowStartCursor}</b> → next <b>${windowNextCursor}</b>\n🧹 Left on rotate: <b>${leftOnRotate}</b>${leaveFailedOnRotate ? ` (failed: ${leaveFailedOnRotate})` : ''}\n🗃 Sources: shared=${sharedCount} • legacy=${legacyCount} • pending=${pendingCount}\n${validationLine}\n${dropLine}\n\n⏳ Scanning & joining slowly...`,
                     { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: backLabel, callback_data: backCallback }]] } }
                 ).catch(() => {});
             }
@@ -4171,13 +4186,15 @@ async function startTelegram() {
 
         try {
             const cycles = await readIntelNodeCycles();
+            let preservedCursorForMessage = 0;
             if (cycles) {
                 const existing = cycles[sessionKey] || {};
                 const preservedCursor = Number(existing.cursor || 0);
+                preservedCursorForMessage = Number.isFinite(preservedCursor) && preservedCursor >= 0 ? preservedCursor : 0;
                 // Keep cursor progression so reset moves to a fresh window instead of reusing the same first chunk.
                 cycles[sessionKey] = {
                     ...existing,
-                    cursor: Number.isFinite(preservedCursor) && preservedCursor >= 0 ? preservedCursor : 0,
+                    cursor: preservedCursorForMessage,
                     activeCodes: [],
                     startedAt: Date.now(),
                     lastManualResetAt: Date.now(),
@@ -4187,6 +4204,23 @@ async function startTelegram() {
             const resumePath = path.join(__dirname, `../data/intel_join_${sessionKey}.json`);
             await fsp.unlink(resumePath).catch(() => {});
             global._intelJoinResults?.delete(sessionKey);
+
+            const view = await buildIntelJoinMenuView(sessionKey);
+            return ctx.editMessageText(
+                `✅ <b>Intel join cycle reset.</b>\n📱 Node: +${sessionKey.split('_')[1] || sessionKey}\n🧭 Next window cursor preserved at: <b>${preservedCursorForMessage}</b>\n\nYou can now start a fresh join window immediately.`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: '▶️ Start Intel Join', callback_data: `intel_join_${sessionKey}`, style: 'success' },
+                                { text: '🔁 Refresh Intel Menu', callback_data: `intel_menu_${sessionKey}`, style: 'primary' },
+                            ],
+                            [ { text: '🔙 Back to Node', callback_data: `node_${sessionKey}`, style: 'primary' } ],
+                        ],
+                    },
+                }
+            ).catch(() => ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {}));
         } catch (err) {
             logger.warn('[Intel Join] Failed to reset cycle', { sessionKey, error: err.message });
         }
