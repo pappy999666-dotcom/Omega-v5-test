@@ -5,6 +5,7 @@ const fsp    = require('fs').promises;
 const path   = require('path');
 const logger = require('../core/logger');
 const eventBus = require('../core/eventBus');
+const { guardGroupMetadataMutation } = require('../core/groupSafety');
 const { ownerWhatsAppJids } = require('../config');
 
 function getDbPath(botId) {
@@ -674,11 +675,21 @@ module.exports = {
 
         // ── MUTE / UNMUTE ─────────────────────────────────────────────────────
         if (cmd === '.mute') {
+            const gate = guardGroupMetadataMutation({ jid, command: cmd, action: 'announcement' });
+            if (!gate.ok) {
+                const waitSec = Math.max(1, Math.ceil(Number(gate.waitMs || 0) / 1000));
+                return sock.sendMessage(jid, { text: gate.reason === 'cooldown' ? `⏳ Group metadata cooldown active. Retry in ${waitSec}s.` : '⚠️ Group metadata guard blocked this action.' }, { quoted: msg });
+            }
             await sock.groupSettingUpdate(jid, 'announcement');
             return sock.sendMessage(jid, { text: '🔇 Group muted. Only admins can send messages.' }, { quoted: msg });
         }
 
         if (cmd === '.unmute') {
+            const gate = guardGroupMetadataMutation({ jid, command: cmd, action: 'announcement' });
+            if (!gate.ok) {
+                const waitSec = Math.max(1, Math.ceil(Number(gate.waitMs || 0) / 1000));
+                return sock.sendMessage(jid, { text: gate.reason === 'cooldown' ? `⏳ Group metadata cooldown active. Retry in ${waitSec}s.` : '⚠️ Group metadata guard blocked this action.' }, { quoted: msg });
+            }
             await sock.groupSettingUpdate(jid, 'not_announcement');
             return sock.sendMessage(jid, { text: '🔊 Group unmuted. Everyone can send messages.' }, { quoted: msg });
         }

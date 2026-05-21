@@ -1437,7 +1437,7 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                                 await sock.sendMessage(jid, { delete: statusMsg.key }).catch(() => {});
                             }
                         } catch (e) {
-                            await sock.sendMessage(jid, { text: `❌ Download failed: ${e.message}` }, { quoted: msg });
+                            await sendPremiumText(sock, jid, `❌ Download failed: ${e.message}`, { quoted: msg });
                         }
                     }
                     break;
@@ -1698,7 +1698,7 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                         );
                         
                         if (isDestructive) {
-                            await sock.sendMessage(jid, { text: 'nah i\'m not deleting my own infrastructure or the bot files. that\'s self-destruction. i can do everything else tho' }, { quoted: msg });
+                            await sendPremiumText(sock, jid, 'nah i\'m not deleting my own infrastructure or the bot files. that\'s self-destruction. i can do everything else tho', { quoted: msg });
                             logger.warn(`[AI] Blocked destructive command: ${command}`);
                             return;
                         }
@@ -1715,11 +1715,11 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                         logger.success(`[AI CMD] Output:\n${result.slice(0, 500)}`);
                         const finalOutput = result.length > 2000 ? result.slice(0, 2000) + '\n\n... (output truncated)' : result;
                         
-                        await sock.sendMessage(jid, { text: `\`\`\`\n${finalOutput}\n\`\`\`` }, { quoted: msg });
+                        await sendPremiumText(sock, jid, `\`\`\`\n${finalOutput}\n\`\`\``, { quoted: msg });
                         logger.success('[AI] Command executed');
                     } catch (err) {
                         logger.error(`[AI] Command failed: ${err.message}`);
-                        await sock.sendMessage(jid, { text: `error: ${err.message}` }, { quoted: msg });
+                        await sendPremiumText(sock, jid, `error: ${err.message}`, { quoted: msg });
                     }
                     return;
                 }
@@ -1730,19 +1730,19 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 }
                 if (response.startsWith('GENERATE_IMAGE:')) {
                     try { await sock.sendMessage(jid, { image: await ai.generateImage(response.slice(15).trim()), caption: '' }, { quoted: msg }); }
-                    catch { await sock.sendMessage(jid, { text: "couldn't generate that image" }, { quoted: msg }); }
+                    catch { await sendPremiumText(sock, jid, "couldn't generate that image", { quoted: msg }); }
                     return;
                 }
                 if (response.startsWith('SPEAK:')) {
                     try { await sock.sendMessage(jid, { audio: await ai.textToSpeech(response.slice(6).trim()), mimetype: 'audio/mpeg', ptt: true }, { quoted: msg }); }
-                    catch { await sock.sendMessage(jid, { text: response.slice(6).trim() }, { quoted: msg }); }
+                    catch { await sendPremiumText(sock, jid, response.slice(6).trim(), { quoted: msg }); }
                     return;
                 }
                 if (response.startsWith('SEARCH_VIDEO:')) {
                     try {
                         const { buffer, title } = await ai.searchVideo(response.slice(13).trim());
                         await sock.sendMessage(jid, { video: buffer, caption: title, mimetype: 'video/mp4' }, { quoted: msg });
-                    } catch { await sock.sendMessage(jid, { text: "couldn't find that video" }, { quoted: msg }); }
+                    } catch { await sendPremiumText(sock, jid, "couldn't find that video", { quoted: msg }); }
                     return;
                 }
                 if (response.startsWith('SEND_STICKER:')) {
@@ -1779,7 +1779,7 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                         logger.success('[AI] Sticker sent & cached');
                     } catch (err) {
                         logger.error(`[AI] Sticker failed: ${err.message}`);
-                        await sock.sendMessage(jid, { text: "couldn't make that sticker rn" }, { quoted: msg });
+                        await sendPremiumText(sock, jid, "couldn't make that sticker rn", { quoted: msg });
                     }
                     return;
                 }
@@ -1828,7 +1828,7 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
 
             } catch (err) {
                 logger.warn(`[AI] Failed: ${err.message}`);
-                await sock.sendMessage(jid, { text: 'something went wrong, try again' }, { quoted: msg }).catch(() => {});
+                await sendPremiumText(sock, jid, 'something went wrong, try again', { quoted: msg }).catch(() => {});
             }
             }); // End AI queue task
             return;

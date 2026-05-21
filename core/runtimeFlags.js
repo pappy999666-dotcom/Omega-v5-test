@@ -16,4 +16,6 @@ module.exports = {
     premiumResponseEngine: envFlag('PREMIUM_RESPONSE_ENGINE', true),
     // Protect link metadata extraction by preserving clean URL-bearing text.
     preserveLinkMetadata: envFlag('PRESERVE_LINK_METADATA', true),
+    // Prevent accidental/spammy group metadata mutations.
+    groupMetadataGuard: envFlag('GROUP_METADATA_GUARD', true),
 };
