@@ -51,6 +51,10 @@ const GHOST_SEND_DELAY_MS = 800;    // increased
 const GHOST_DELETE_DELAY_MS = 1000;  // increased
 const GHOST_RETRY_DELAY_MS = 2000;
 const GHOST_PRE_STATUS_SETTLE_MS = Math.max(800, Number(process.env.BULL_GHOST_PRE_STATUS_SETTLE_MS || 1800));
+const GHOST_MAX_ATTEMPTS_DEFAULT = Math.max(2, Number(process.env.BULL_GHOST_MAX_ATTEMPTS_DEFAULT || 3));
+const GHOST_MAX_ATTEMPTS_LARGE_GROUP = Math.max(GHOST_MAX_ATTEMPTS_DEFAULT, Number(process.env.BULL_GHOST_MAX_ATTEMPTS_LARGE_GROUP || 6));
+const GHOST_PRE_STATUS_SETTLE_LARGE_MS = Math.max(GHOST_PRE_STATUS_SETTLE_MS, Number(process.env.BULL_GHOST_PRE_STATUS_SETTLE_LARGE_MS || 2800));
+const GHOST_FAIL_COOLDOWN_LARGE_MS = Math.max(1200, Number(process.env.BULL_GHOST_FAIL_COOLDOWN_LARGE_MS || 3500));
 const INTER_JOB_DELAY_MS = 1500;     // delay between each group send
 const MAX_STATUS_THUMB_BYTES = 45 * 1024;
 const GODCAST_POST_DELAY_MS = Math.max(1500, Number(process.env.BULL_GODCAST_POST_DELAY_MS || 4500));
@@ -432,7 +436,7 @@ async function processBroadcastJob(job) {
             let ghostInjected = false;
             let ghostDeleted = false;
             let retries = 0;
-            const maxRetries = 2; // reduced from 3 — less hammering
+            const maxRetries = isLargeGroup ? GHOST_MAX_ATTEMPTS_LARGE_GROUP : GHOST_MAX_ATTEMPTS_DEFAULT;
 
             // Use random single emoji instead of invisible chars — less detectable
             const GHOST_CHARS = ['​', '⁠', '⁡', '⁢', '⁣'];
@@ -442,14 +446,20 @@ async function processBroadcastJob(job) {
                 try {
                     const ghost = await withTimeout(sock.sendMessage(targetJid, { text: ghostText }), 15000);
                     if (!ghost?.key) throw new Error('Ghost message key not received');
-                    // Random human-like delay before delete (0.5s - 1.5s)
-                    await delay(500 + Math.floor(Math.random() * 1000));
+                    // Random human-like delay before delete; longer for large groups.
+                    const preDeleteDelay = isLargeGroup
+                        ? (900 + Math.floor(Math.random() * 1400))
+                        : (500 + Math.floor(Math.random() * 1000));
+                    await delay(preDeleteDelay);
                     ghostInjected = true;
 
                     try {
                         await withTimeout(sock.sendMessage(targetJid, { delete: ghost.key }), 15000);
-                        // Random settle delay (0.3s - 0.8s)
-                        await delay(300 + Math.floor(Math.random() * 500));
+                        // Random settle delay; longer for large groups.
+                        const postDeleteDelay = isLargeGroup
+                            ? (700 + Math.floor(Math.random() * 900))
+                            : (300 + Math.floor(Math.random() * 500));
+                        await delay(postDeleteDelay);
                         ghostDeleted = true;
                     } catch (deleteErr) {
                         logger.warn(`👻 Ghost delete failed for ${targetJid}, posting status anyway: ${deleteErr.message}`);
@@ -464,9 +474,14 @@ async function processBroadcastJob(job) {
             ghostDurationMs = Date.now() - ghostStartedAt;
             if (ghostInjected) {
                 logger.info(`👻 Ghost protocol ${ghostDeleted ? 'succeeded' : 'partial'} for ${targetJid}`);
-                await delay(ghostDeleted ? GHOST_PRE_STATUS_SETTLE_MS : Math.floor(GHOST_PRE_STATUS_SETTLE_MS / 2));
+                const baseSettleMs = isLargeGroup ? GHOST_PRE_STATUS_SETTLE_LARGE_MS : GHOST_PRE_STATUS_SETTLE_MS;
+                await delay(ghostDeleted ? baseSettleMs : Math.floor(baseSettleMs / 2));
             } else {
                 logger.warn(`👻 Ghost send failed after ${maxRetries} attempts for ${targetJid}, posting status directly`);
+                // For large-group godcast, add a cooldown before status send to avoid immediate churn.
+                if (isLargeGroup && useGhostProtocol) {
+                    await delay(GHOST_FAIL_COOLDOWN_LARGE_MS);
+                }
             }
         }
 
@@ -715,7 +730,10 @@ async function processBroadcastJob(job) {
                         backgroundColor: statusBg
                     }
                 };
-                await sendPayloadWithRetry(fallbackPayload, SEND_ATTEMPTS_STATUS_FALLBACK, 'status-fallback');
+                const fallbackAttempts = isLargeGroup
+                    ? Math.max(SEND_ATTEMPTS_STATUS_FALLBACK, SEND_ATTEMPTS_LARGE_GROUP)
+                    : SEND_ATTEMPTS_STATUS_FALLBACK;
+                await sendPayloadWithRetry(fallbackPayload, fallbackAttempts, 'status-fallback');
                 usedLinkPreview = false;
             } else {
                 throw primarySendErr;

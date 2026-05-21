@@ -38,10 +38,16 @@ class ReconnectManager {
         return Math.min(this.maxDelayMs, exp + jitter);
     }
 
-    async schedule(sessionKey, reconnectFn, reason = 'close') {
+    async schedule(sessionKey, reconnectFn, reasonOrOptions = 'close') {
         if (this.locks.has(sessionKey)) return false;
         const s = this.get(sessionKey);
         if (s.status === STATES.DESTROYED || s.status === STATES.DEAD) return false;
+
+        const opts = (reasonOrOptions && typeof reasonOrOptions === 'object' && !Array.isArray(reasonOrOptions))
+            ? reasonOrOptions
+            : { reason: reasonOrOptions };
+        const reason = String(opts.reason || 'close');
+        const requestedDelay = Number(opts.delayMs);
 
         s.attempts += 1;
         if (s.attempts > this.maxAttempts) {
@@ -53,7 +59,9 @@ class ReconnectManager {
 
         this.locks.add(sessionKey);
         s.status = STATES.RECONNECTING;
-        const delayMs = this.computeDelay(s.attempts);
+        const delayMs = Number.isFinite(requestedDelay) && requestedDelay >= 0
+            ? Math.min(this.maxDelayMs, requestedDelay)
+            : this.computeDelay(s.attempts);
         s.cooldownUntil = Date.now() + delayMs;
         this.state.set(sessionKey, s);
         this.metrics?.inc?.('reconnect.scheduled');

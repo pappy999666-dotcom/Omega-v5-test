@@ -220,13 +220,23 @@ async function fetchWhatsAppGroupMeta(url) {
             if (info?.id) {
                 try { const pp = await sock.profilePictureUrl(info.id, 'image'); if (pp) thumbnail = await fetchImageBuffer(pp); } catch {}
             }
-            return { title: info?.subject || 'WhatsApp Group', description: info?.desc || `${info?.size || 0} members`, thumbnail };
+            const safeThumb = await normalizeThumbnailBuffer(thumbnail);
+            return {
+                title: info?.subject || 'WhatsApp Group',
+                description: info?.desc || `${info?.size || 0} members`,
+                thumbnail: safeThumb || DEFAULT_THUMB
+            };
         } catch {}
     }
     const scraped = await scrapeOgMeta(url);
     if (scraped) {
         const thumb = scraped.thumbnailUrl ? await fetchImageBuffer(scraped.thumbnailUrl) : null;
-        return { title: scraped.title || 'WhatsApp Group', description: scraped.description || '💬 Tap to join', thumbnail: thumb || DEFAULT_THUMB };
+        const safeThumb = await normalizeThumbnailBuffer(thumb);
+        return {
+            title: scraped.title || 'WhatsApp Group',
+            description: scraped.description || '💬 Tap to join',
+            thumbnail: safeThumb || DEFAULT_THUMB
+        };
     }
     return { title: 'WhatsApp Group', description: '💬 Tap to join', thumbnail: DEFAULT_THUMB };
 }

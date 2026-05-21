@@ -166,6 +166,16 @@ function buildIntelNodeJoinWindow(allCodes, sessionKey, cursor, maxSize, chunkSi
     return chunkedRoundOrder(shuffled, chunkSize, startChunk);
 }
 
+function formatIntelCycleAge(ms) {
+    const totalMinutes = Math.max(0, Math.floor(Number(ms || 0) / 60000));
+    const days = Math.floor(totalMinutes / 1440);
+    const hours = Math.floor((totalMinutes % 1440) / 60);
+    const mins = totalMinutes % 60;
+    if (days > 0) return `${days}d ${hours}h`;
+    if (hours > 0) return `${hours}h ${mins}m`;
+    return `${mins}m`;
+}
+
 function isIntelDeadLinkError(message) {
     const m = String(message || '').toLowerCase();
     // Never purge for policy/rate/transient/network/socket conditions.
@@ -3636,11 +3646,46 @@ async function startTelegram() {
                 [ { text: '📸 Group Status (Config)', callback_data: `gstatus_node_${sessionKey}`, style: 'success' } ],
                 [ { text: '🌟 Set GC Status', callback_data: `setnewgcstatus_node_${sessionKey}`, style: 'success' } ],
                 [ { text: `🧬 AI Vibe: ${getAiVibeLabel(getAiVibeForNode(userId, sessionKey))}`, callback_data: `node_vibe_toggle_${sessionKey}`, style: 'primary' } ],
-                [ { text: '🔗 Join Intel GCs', callback_data: `intel_join_${sessionKey}`, style: 'success' } ],
+                [ { text: '🔗 Join Intel GCs', callback_data: `intel_menu_${sessionKey}`, style: 'success' } ],
                 [ { text: '📤 Send All Intel Links', callback_data: `intel_send_${sessionKey}` } ],
                 [ { text: '💬 Chat Mode (send cmds to this node)', callback_data: `chat_node_${sessionKey}`, style: 'success' } ],
                 [ { text: '🔙 Back to Nodes', callback_data: 'menu_nodes', style: 'primary' } ]
             ]
+        };
+
+        return { text, reply_markup };
+    }
+
+    async function buildIntelJoinMenuView(sessionKey) {
+        const phone = sessionKey.split('_')[1] || sessionKey;
+        const cycles = await readIntelNodeCycles();
+        const cycle = cycles?.[sessionKey] || null;
+        const activeCodes = Array.isArray(cycle?.activeCodes) ? cycle.activeCodes.length : 0;
+        const startedAt = Number(cycle?.startedAt || 0);
+        const age = startedAt ? formatIntelCycleAge(Date.now() - startedAt) : 'not started';
+        const running = !!global._intelJoinWorkers?.get(sessionKey)?.running;
+
+        const text = [
+            `🔗 <b>INTEL JOIN CONTROL</b>`,
+            `📱 Node: +${phone}`,
+            '',
+            `🎯 Window cap: <b>${TG_INTEL_NODE_MAX_GROUPS}</b>`,
+            `📦 Active cycle links: <b>${activeCodes}</b>`,
+            `🕒 Cycle age: <b>${escapeHtml(String(age))}</b>`,
+            `🏃 Worker: <b>${running ? 'Running' : 'Idle'}</b>`,
+            '',
+            '<i>Use reset when this node reached cap and you want a fresh join window now.</i>',
+        ].join('\n');
+
+        const reply_markup = {
+            inline_keyboard: [
+                [
+                    { text: '▶️ Start Intel Join', callback_data: `intel_join_${sessionKey}`, style: 'success' },
+                    { text: '♻️ Reset Join Cycle', callback_data: `intel_reset_${sessionKey}`, style: 'danger' },
+                ],
+                [ { text: '📤 Send All Intel Links', callback_data: `intel_send_${sessionKey}`, style: 'primary' } ],
+                [ { text: '🔙 Back to Node', callback_data: `node_${sessionKey}`, style: 'primary' } ],
+            ],
         };
 
         return { text, reply_markup };
@@ -4096,8 +4141,67 @@ async function startTelegram() {
         return { started: true, reason: 'started', sessionKey, phone };
     }
 
+    // ─── INTEL GC JOIN SUBMENU (per node) ────────────────────────────────────
+    bot.action(/^intel_menu_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+        const view = await buildIntelJoinMenuView(sessionKey);
+        return ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {});
+    });
+
+    // ─── INTEL GC RESET CYCLE (per node) ─────────────────────────────────────
+    bot.action(/^intel_reset_(.+)$/, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        const sessionKey = ctx.match[1];
+        const userId = String(ctx.from?.id || '');
+        const userRole = ctx.state?.userRole || rbac.getUserRole(userId);
+        if (!resolveTelegramNodeScope(userId, userRole, sessionKey)) {
+            return ctx.reply('⚠️ Access denied for this node.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        const running = !!global._intelJoinWorkers?.get(sessionKey)?.running;
+        if (running) {
+            return ctx.reply('⏳ Intel join is currently running for this node. Wait for completion, then reset.', { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        try {
+            const cycles = await readIntelNodeCycles();
+            if (cycles && cycles[sessionKey]) {
+                delete cycles[sessionKey];
+                await writeIntelNodeCycles(cycles);
+            }
+            const resumePath = path.join(__dirname, `../data/intel_join_${sessionKey}.json`);
+            await fsp.unlink(resumePath).catch(() => {});
+            global._intelJoinResults?.delete(sessionKey);
+        } catch (err) {
+            logger.warn('[Intel Join] Failed to reset cycle', { sessionKey, error: err.message });
+        }
+
+        const view = await buildIntelJoinMenuView(sessionKey);
+        return ctx.editMessageText(
+            `✅ <b>Intel join cycle reset.</b>\n📱 Node: +${sessionKey.split('_')[1] || sessionKey}\n\nYou can now start a fresh join window immediately.`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '▶️ Start Intel Join', callback_data: `intel_join_${sessionKey}`, style: 'success' },
+                            { text: '🔁 Refresh Intel Menu', callback_data: `intel_menu_${sessionKey}`, style: 'primary' },
+                        ],
+                        [ { text: '🔙 Back to Node', callback_data: `node_${sessionKey}`, style: 'primary' } ],
+                    ],
+                },
+            }
+        ).catch(() => ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup }).catch(() => {}));
+    });
+
     // ─── INTEL GC JOIN (per node, slow & safe) ───────────────────────────────
-        bot.action(/^intel_join_(?!all$)(.+)$/, async (ctx) => {
+    bot.action(/^intel_join_(?!all$)(.+)$/, async (ctx) => {
         ctx.answerCbQuery().catch(() => {});
         const sessionKey = ctx.match[1];
         const userId = String(ctx.from?.id || '');

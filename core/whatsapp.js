@@ -236,8 +236,18 @@ function prunePeerSessions(sessionDir, maxFiles = MAX_PEER_SESSION_FILES) {
     })();
 }
 
-function getCachedAdminStatus(jid, sender) {
-    return groupCache.isAdmin(jid, sender);
+function getCachedAdminStatus(sock, jid, sender) {
+    // Fast path: check cache immediately
+    const isAdmin = groupCache.isAdmin(jid, sender, sock);
+    
+    // Background refresh: if socket is healthy AND cache miss/expired, warm up async
+    if (!isAdmin && sock && jid && !jid.includes('@s.us')) {
+        setImmediate(() => {
+            groupCache.getGroupMeta(sock, jid).catch(() => {});
+        });
+    }
+    
+    return isAdmin;
 }
 
 function refreshGroupMeta(sock, jid) {
@@ -989,7 +999,7 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 kernel.reconnectManager.schedule(
                     sessionKey,
                     () => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1),
-                    'rate-limit-429'
+                    { reason: 'rate-limit-429', delayMs: rateLimitDelay }
                 );
                 return;
             }
@@ -1024,7 +1034,7 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                     kernel.reconnectManager.schedule(
                         sessionKey,
                         () => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1),
-                        'bad-mac-soft'
+                        { reason: 'bad-mac-soft', delayMs: backoff }
                     );
                     return;
                 }
@@ -1032,6 +1042,7 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 // 3rd-4th bad MAC — wipe signal files but keep creds + app-state
                 try {
                     if (fs.existsSync(dir)) {
+                        prunePeerSessions(dir, MAX_PEER_SESSION_FILES);
                         const files = fs.readdirSync(dir);
                         for (const f of files) {
                             if (f === 'creds.json' || f === 'connected.flag') continue;
@@ -1049,7 +1060,7 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                 kernel.reconnectManager.schedule(
                     sessionKey,
                     () => startWhatsApp(chatId, phoneNumber, slotId, true, retryCount + 1),
-                    'bad-mac-signal-wipe'
+                    { reason: 'bad-mac-signal-wipe', delayMs: backoff }
                 );
                 return;
             }
@@ -1097,6 +1108,7 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
                     } catch {}
                 });
             }
+            prunePeerSessions(path.join(SESSIONS_PATH, sessionKey), MAX_PEER_SESSION_FILES);
             engine.triggerBoot(sock);
             require('./eventBus').emit('socket.open', sock);
 
@@ -1336,8 +1348,8 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
         }
 
         const sender = msg.key.fromMe ? fullBotJid : resolveSenderJid(msg, fullBotJid);
-        let isGroupAdmin = isGroup ? getCachedAdminStatus(jid, sender) : false;
-        let botIsGroupAdmin = isGroup ? getCachedAdminStatus(jid, fullBotJid) : false;
+        let isGroupAdmin = isGroup ? getCachedAdminStatus(sock, jid, sender) : false;
+        let botIsGroupAdmin = isGroup ? getCachedAdminStatus(sock, jid, fullBotJid) : false;
 
         // Private mode: only node owner + general owner can interact at all
         if (nodeMode === 'private' && !msg.key.fromMe && !isOwnerJidForSession(sender, phoneNumber)) {
@@ -1517,7 +1529,8 @@ async function startWhatsApp(chatId = ownerTelegramId, phoneNumber, slotId = '1'
         // Explicit mention/reply triggers always work in groups.
         // Keyword trigger "pappy" follows .pappy mode state so OFF truly disables it.
         const hasPappyTrigger = pappyOn && !msg.key.fromMe && /\bpappy\b/i.test(text);
-        const explicitGroupTrigger = isMentioned || isReplyToBot || isStickerReplyToBot || hasPappyTrigger;
+        // Group AI must respect .pappy on/off strictly. If OFF, do not answer ambient or explicit AI triggers.
+        const explicitGroupTrigger = pappyOn && (isMentioned || isReplyToBot || isStickerReplyToBot || hasPappyTrigger);
         const ambientGroupTrigger = pappyOn && (hasSticker || !!String(text || '').trim());
 
         const shouldRespond = !msg.key.fromMe && (
